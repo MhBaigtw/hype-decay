@@ -34,6 +34,17 @@ Step Functions, EventBridge Scheduler, DynamoDB (on-demand only), SNS,
 CloudWatch, IAM, API Gateway HTTP API, AWS Budgets. ECS Fargate and Kinesis
 Firehose become allowed at v3 and not before.
 
+**One small compute instance is permitted, for the backfill only.** This is
+the single exception to the idle-cost rule above. A 24 to 70 hour transfer must
+not depend on a laptop staying awake, and running it from the home connection
+puts that IP under the Wikimedia rate limits. Conditions, all required:
+
+- smallest instance type that keeps the transfer saturated
+- time-boxed, with the box stated before launch
+- terminated on completion, not stopped
+- a documented shutdown check, and the termination recorded in `NOTES.md`
+- nothing else with an idle hourly cost, before or after
+
 **Region is `us-east-1`.** Everything. No exceptions.
 
 **Every Athena query must filter on a partition column.** The workgroup has a
@@ -63,10 +74,22 @@ every result by an hour and silently corrupts the entire output.
 **Desktop and mobile are separate domain codes.** `en` and `en.m` must be
 summed into one project. Reading only `en` undercounts by roughly half.
 
-**Bot traffic does not decay like human traffic.** If using
-`pageview_complete`, filter to `agent_type = 'user'`. If using the simple
-`pageviews` dataset, note in the README that bot traffic is unfiltered and
-that this is a known limitation.
+**Bot traffic does not decay like human traffic.** The `pageviews` dataset is
+already agent-filtered to `user`. Task 0 confirmed that against the Wikimedia
+REST API to the exact view: desktop 4,024,554, and mobile 5,966,626 =
+5,742,163 mobile-web + 224,463 mobile-app. There is nothing to filter out, and
+no `agent_type` column to filter on.
+
+The real risk is automated traffic that Wikimedia MISCLASSIFIES as `user`.
+Worked example: `.xyz` took 24,025 views in a single hour on 2026-09-10 and is
+not caught by the namespace exclusions in `SPEC.md`; the REST daily split for
+that title is 121k `user` against 262k `automated`. Inside our data the
+user-classified share is indistinguishable from human traffic, so this is a
+documented limitation, not something to fix.
+
+Add an optional flag for spikes whose hourly profile is suspiciously flat.
+Human attention has a diurnal shape and crawlers do not. The flag is advisory:
+it annotates a spike, it never drops one.
 
 ## Working agreement
 

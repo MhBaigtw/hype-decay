@@ -46,9 +46,17 @@ worthless until it has been seen to fire.
 Smallest possible slice end to end.
 
 - Downloader respecting the 3-connection cap and the User-Agent policy
-- Writes byte-identical source files to `raw/pageviews/dt=.../hour=.../`
-- DynamoDB table tracking each hour: pending, in-flight, done, failed, with
-  the source ETag or content length for verification
+- Converts to Parquet in flight and writes `curated/`. There is no raw zone -
+  see the SPEC storage model
+- DynamoDB manifest, one row per hour, carrying at minimum:
+  - status: pending, in-flight, done, failed
+  - the source URL
+  - the source content-length
+  - a content hash (sha256) of the bytes as fetched
+  - rows parsed, for the Task 4 reconciliation
+
+  Status alone is not enough. With no raw zone, these fields are the only thing
+  that makes an hour re-fetchable and byte-verifiable later
 - Resumable: killing it mid-run and restarting must not duplicate or skip
 
 **Definition of done:** one hour of data is in S3, the manifest row says done,
@@ -70,21 +78,39 @@ explicitly failed with a reason, and the failure count is under 1%.
 
 ---
 
-## Task 4 — Raw to curated
+## Task 4 — Source to curated
 
 Glue Spark job, max 10 DPU, 30 minute timeout.
 
-- Parse both 4-column and 5/6-column widths depending on the dataset chosen
-- Apply `hour_start = filename_hour - 1` — see SPEC, this is the critical one
+- Parse the 4-column `pageviews` format. `pageview_complete` is out of scope,
+  so there is no second width to handle
+- Apply `hour_start = filename_hour - 1` — see SPEC, this is the critical one,
+  and it is specific to the `pageviews` dataset
 - Union `en` and `en.m` into one project
 - Apply the SPEC exclusion list
-- Write Iceberg partitioned by `dt`, registered in the Glue Catalog
+- Write both tiers: `page_daily` for every page-day, `page_hour` only where
+  hourly views are 10 or more. Iceberg, partitioned by `dt`, registered in the
+  Glue Catalog
 
-**Definition of done:** row counts reconcile against the raw files within
-0.1%, a spot-check of 5 known pages matches the Wikimedia Pageviews web tool
-for the same hours, and the same Athena query scans dramatically fewer bytes
-than against raw. Record both byte figures in `NOTES.md` — that number goes in
-the README.
+**One month first, before the full run.** Convert a single month, then report:
+
+- measured Parquet size for `page_daily` and for `page_hour`, separately
+- DPU-minutes consumed
+
+Extrapolate the cost of the full 24-month run from that measurement. **If the
+extrapolation exceeds $8, stop and get approval before converting anything
+else.** Task 0 flagged Glue capacity against roughly 1 TB of gzipped source as
+unestimated; this measurement closes that gap for the price of one month
+instead of the whole budget.
+
+**Definition of done:** the one-month figures above are recorded, and then for
+the full run: row counts reconcile within 0.1% against the per-hour rows-parsed
+recorded in the manifest at transfer time (there is no raw zone left to
+recount), a spot-check of 5 known pages matches the Wikimedia Pageviews web
+tool for the same hours, and an Athena query against `page_hour` scans
+dramatically fewer bytes than the same query against the 48-hour raw gz
+fixture. Record both byte figures in `NOTES.md` — that number goes in the
+README.
 
 ---
 
