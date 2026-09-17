@@ -1,0 +1,31 @@
+# terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+crash.log
+
+# credentials - never commit
+.env
+.env.*
+credentials
+*.pem
+*.key
+aws.json
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# dbt
+transform/target/
+transform/dbt_packages/
+transform/logs/
+
+# local data
+data/
+*.gz
+*.bz2
+*.zip

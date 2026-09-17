@@ -1,0 +1,157 @@
+# TASKS
+
+One task per branch. Stop at the end of each task and report. Do not start the
+next one without being told.
+
+Each task lists a **Definition of done**. If you cannot meet it, stop and say
+why rather than partially meeting it and moving on.
+
+---
+
+## Task 0 — Recon (no AWS)
+
+Run `scripts/recon.py --selftest`, then edit `USER_AGENT` and run it live.
+
+Record in `NOTES.md`: measured hourly file size, extrapolated 2-year raw
+volume, estimated backfill hours at 3 connections, mobile traffic share,
+whether `pageview_complete` is tractable, median GDELT mention lag.
+
+**Definition of done:** the numbers are recorded and a recommendation is made
+on `pageviews` vs `pageview_complete` with a stated reason. No AWS resource
+exists yet.
+
+---
+
+## Task 1 — Account guardrails and Terraform backend
+
+Before any pipeline code.
+
+- AWS Budget at $10 with email alert at 50%, 80%, 100%
+- CloudWatch billing alarm as a second independent tripwire
+- IAM user or role for deployment, least privilege, no root keys anywhere
+- S3 bucket for Terraform remote state, versioned, DynamoDB lock table
+- Athena workgroup with a per-query data scan limit of 5 GB
+- `.gitignore` covering `.terraform/`, `*.tfstate*`, `.env`, `*.pem`,
+  `credentials`
+
+**Definition of done:** `terraform plan` is clean, the budget alert has been
+confirmed by email, and an intentionally unpartitioned Athena query is
+rejected by the workgroup limit. Demonstrate that rejection — the guardrail is
+worthless until it has been seen to fire.
+
+---
+
+## Task 2 — Raw ingestion, one hour
+
+Smallest possible slice end to end.
+
+- Downloader respecting the 3-connection cap and the User-Agent policy
+- Writes byte-identical source files to `raw/pageviews/dt=.../hour=.../`
+- DynamoDB table tracking each hour: pending, in-flight, done, failed, with
+  the source ETag or content length for verification
+- Resumable: killing it mid-run and restarting must not duplicate or skip
+
+**Definition of done:** one hour of data is in S3, the manifest row says done,
+and re-running the downloader for that hour is a no-op.
+
+---
+
+## Task 3 — Backfill
+
+Scale Task 2 to 2 years without getting the owner's IP banned.
+
+- Sequential, throttled, resumable, restartable after days of downtime
+- Gaps logged explicitly. Wikimedia has had outages; missing hours are real
+  and must be visible in the data, never silently filled
+- Progress visible without SSH — CloudWatch metric or a manifest query
+
+**Definition of done:** manifest shows every hour in the window as done or
+explicitly failed with a reason, and the failure count is under 1%.
+
+---
+
+## Task 4 — Raw to curated
+
+Glue Spark job, max 10 DPU, 30 minute timeout.
+
+- Parse both 4-column and 5/6-column widths depending on the dataset chosen
+- Apply `hour_start = filename_hour - 1` — see SPEC, this is the critical one
+- Union `en` and `en.m` into one project
+- Apply the SPEC exclusion list
+- Write Iceberg partitioned by `dt`, registered in the Glue Catalog
+
+**Definition of done:** row counts reconcile against the raw files within
+0.1%, a spot-check of 5 known pages matches the Wikimedia Pageviews web tool
+for the same hours, and the same Athena query scans dramatically fewer bytes
+than against raw. Record both byte figures in `NOTES.md` — that number goes in
+the README.
+
+---
+
+## Task 5 — dbt models
+
+`dbt-athena`. Layered: staging, intermediate, marts.
+
+- `stg_page_hour` — cleaned base grain
+- `int_page_daily` — daily rollup
+- `int_baselines` — trailing 28-day median with the 2-day offset
+- `int_spikes` — spike detection per SPEC, including the 30-day merge rule
+- `fct_half_life` — peak, excess curve, half-life, censoring flag
+
+Tests: uniqueness on every declared grain, non-negative views, no nulls in
+join keys, and an accepted-range test on `half_life_hours`.
+
+**Definition of done:** `dbt build` passes clean, and the half-life
+distribution plus censored rate are printed in `NOTES.md`. If the censored
+rate exceeds 40%, stop and flag it — the spike thresholds probably need
+revisiting before anything is built on top.
+
+---
+
+## Task 6 — Hourly incremental
+
+- EventBridge Scheduler, hourly, offset far enough past the hour that the
+  source file exists
+- Step Functions: fetch, land raw, convert, run affected dbt models
+- SNS alert on failure
+- Idempotent. Running the same hour twice changes nothing.
+
+**Definition of done:** runs unattended for 48 hours with no manual
+intervention and no duplicate rows.
+
+---
+
+## Task 7 — API and frontend
+
+- Lambda behind an API Gateway HTTP API. Two endpoints: search a page, return
+  its decay curve; and return the leaderboards.
+- Results cached, because every uncached call is an Athena scan that costs
+  money. Precompute the marts into a small serving table rather than querying
+  Athena per request.
+- Frontend: search box, decay curve, half-life stated in plain words, both
+  leaderboards, and the censored rate shown honestly.
+
+**Definition of done:** a stranger can open the page and understand the
+finding without explanation, and the cost per thousand page views is
+calculated and recorded.
+
+---
+
+## Task 8 — README and cost writeup
+
+Architecture diagram, the scanned-bytes before and after from Task 4, actual
+total spend, the design decisions and what was rejected, and the known
+limitations including bot traffic if the simple dataset was used.
+
+**Definition of done:** the README stands alone for a reader who has never
+seen the project.
+
+---
+
+## v2 and beyond — do not start without approval
+
+- v2: GDELT ingestion, bounded watchlist matching, news-vs-Wikipedia decay
+  comparison
+- v3: live social stream, Fargate consumer, Kinesis Firehose to Iceberg
+
+v1 must be shippable and on a resume before either begins.
