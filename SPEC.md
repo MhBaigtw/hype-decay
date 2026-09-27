@@ -149,8 +149,8 @@ scope and will not be attempted.
 ## Storage model
 
 ```
-s3://<bucket>/curated/page_daily/           Iceberg, partitioned by dt
-s3://<bucket>/curated/page_hour/            Iceberg, partitioned by dt
+s3://<bucket>/curated/page_daily/           Parquet, Hive-partitioned dt=
+s3://<bucket>/curated/page_hour/            Parquet, Hive-partitioned dt=/hour=
 s3://<bucket>/marts/                        dbt outputs
 s3://<bucket>/fixtures/raw_48h/*.gz         48 hours of source gz, fixture only
 ```
@@ -170,6 +170,22 @@ manifest, byte-verifiable against what was originally read.
 
 Retain 48 hours of raw gz as a format-regression test fixture, and nothing
 more. Upstream changing its line format is the failure that fixture catches.
+
+**Who writes which format.** The ingester writes plain Parquet with Hive-style
+partition prefixes (`dt=`, `hour=`). Glue creates and maintains the Iceberg
+tables, in Task 4, reading what the ingester wrote.
+
+Reasoning: writing Iceberg from the ingester would put a pyiceberg and
+Glue-catalog dependency inside a script whose entire job is one HTTP GET, one
+parse and three PUTs, and it would duplicate catalog work that the Glue job does
+natively. Keeping table format in one place keeps the ingester something that can
+be read in one sitting.
+
+The trade-off, stated plainly: until Task 4 runs there are no snapshots and no
+atomic commits over the curated zone, so a reader can see a half-written day. The
+**manifest**, not the S3 file listing, is the authority on which hours are
+complete. Task 2 wrote plain Parquet while this spec still said Iceberg; this
+paragraph replaces that silent divergence.
 
 ## v1 acceptance
 
