@@ -1,0 +1,8 @@
+# Task 2 onwards. Install into a venv:
+#   py -3.13 -m venv .venv
+#   .venv/Scripts/python -m pip install -r requirements.txt
+#
+# recon.py and recon_verify.py deliberately depend on NOTHING: they must run on
+# a bare Python before any project setup exists.
+boto3>=1.35
+pyarrow>=17.0

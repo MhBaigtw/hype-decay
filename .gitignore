@@ -31,5 +31,5 @@ data/
 *.zip
 
 # terraform plan files - can contain sensitive values
-tfplan
+tfplan*
 *.tfplan
