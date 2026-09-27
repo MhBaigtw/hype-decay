@@ -8,6 +8,16 @@ output "state_lock_method" {
   value       = "s3 backend use_lockfile"
 }
 
+output "manifest_table" {
+  description = "Ingestion manifest. One row per source hour."
+  value       = aws_dynamodb_table.manifest.name
+}
+
+output "curated_bucket" {
+  description = "Curated Parquet, plus the 48-hour source gz regression fixture."
+  value       = aws_s3_bucket.curated.bucket
+}
+
 output "athena_workgroup" {
   description = "Scan-limited Athena workgroup. Every query must run in this workgroup."
   value       = aws_athena_workgroup.main.name
