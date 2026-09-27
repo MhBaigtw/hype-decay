@@ -93,11 +93,11 @@ The old table definition is in git history if it is ever wanted back.
 ## Task 2 — Ingestion, one hour end to end
 
 **Built:** `ingest/ingest_hour.py`. One hour, source URL to curated Parquet at
-both tiers, run as `hype-decay-deploy` rather than as administrator.
+both tiers, run as `hype-decay-deploy`, not as administrator.
 
 **Which service does what:** a DynamoDB manifest holds one row per source hour
-with status, URL, content-length, sha256, row counts and output keys. A 60-second
-lease, extended by heartbeat, stops two workers taking the same hour. S3 holds
+with status, URL, content-length, sha256, row counts and output keys. A
+heartbeat lease stops two workers taking the same hour. S3 holds
 the curated Parquet plus that hour's gz in the 48-hour fixture.
 
 **Measured, 2026-09-10T18 (hour_start 17:00):** source gz 61.4 MiB becomes
@@ -106,9 +106,9 @@ page_hour 2.2 MiB (163,085 rows) and page_daily 22.7 MiB (1,748,350 rows), so
 views before exclusions, matching the Task 0 REST figure exactly, with 559,226
 removed by exclusions.
 
-**Resumability, demonstrated:** killed 9s in, manifest left in-flight with
-nothing uploaded; an immediate retry was refused with 45s of lease remaining;
-after expiry, attempt 2 completed; a fourth run was a no-op.
+**Resumability, demonstrated:** killed 9s in: manifest in-flight, nothing
+uploaded; immediate retry refused with 45s of lease left; after expiry attempt 2
+completed; a fourth run was a no-op.
 
 **Decision:** a lease plus conditional writes, not a bare status flag, which a
 killed worker leaves stuck forever.
