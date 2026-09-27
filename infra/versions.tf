@@ -21,11 +21,11 @@ terraform {
   # every later task uses the remote backend with locking.
   #
   backend "s3" {
-    bucket         = "hype-decay-tfstate-820697996849"
-    key            = "guardrails/terraform.tfstate"
-    region         = "us-east-1"
-    dynamodb_table = "hype-decay-tflock"
-    encrypt        = true
+    bucket       = "hype-decay-tfstate-820697996849"
+    key          = "guardrails/terraform.tfstate"
+    region       = "us-east-1"
+    use_lockfile = true
+    encrypt      = true
   }
 }
 

@@ -3,9 +3,9 @@ output "state_bucket" {
   value       = aws_s3_bucket.tfstate.bucket
 }
 
-output "lock_table" {
-  description = "DynamoDB state lock table."
-  value       = aws_dynamodb_table.tflock.name
+output "state_lock_method" {
+  description = "How Terraform state is locked. S3 conditional writes, not DynamoDB."
+  value       = "s3 backend use_lockfile"
 }
 
 output "athena_workgroup" {
@@ -37,8 +37,6 @@ output "next_steps" {
   description = "What has to happen by hand after this apply."
   value = join("\n", [
     "1. Click the confirmation link in the SNS email sent to ${var.contact_email}.",
-    "2. Uncomment the backend block in versions.tf, then run: terraform init -migrate-state",
-    "3. Demonstrate the Athena scan limit rejecting an unpartitioned query.",
-    "4. Once the tripwire-test budget has emailed you, set create_tripwire_test_budget = false and apply.",
+    "2. Once the tripwire-test budget emails you, set create_tripwire_test_budget = false and apply.",
   ])
 }

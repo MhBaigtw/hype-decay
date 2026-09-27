@@ -1,12 +1,22 @@
 # ---------------------------------------------------------------------------
-# Terraform remote state: an S3 bucket for the state file, a DynamoDB table for
-# the lock.
+# Terraform remote state: an S3 bucket, locked by a lock file in that same
+# bucket.
 #
-# Why both: S3 holds the state, and the lock table stops two applies running at
-# once and corrupting it. Terraform can now also lock with a file in S3
-# (use_lockfile), which would make this table unnecessary -- but TASKS.md asks
-# for the DynamoDB table, and on-demand billing makes it effectively free at
-# this scale. Noted in NOTES.md as a decision to revisit.
+# There are two ways to lock Terraform state, and this project has used both.
+#
+#   1. DynamoDB table. A table holds a LockID item for the duration of an
+#      apply, wired up with the backend dynamodb_table parameter. This is what
+#      Task 1 built.
+#   2. S3 conditional writes (use_lockfile = true). Terraform puts a .tflock
+#      object next to the state file and relies on S3 refusing a conditional
+#      write when the object already exists.
+#
+# Switched to (2) and destroyed the table, because Terraform 1.16 deprecates
+# dynamodb_table and warns on every init. Same mutual exclusion, one fewer
+# resource to create, pay for and reason about. The trade-off: locking now
+# depends on S3 semantics alone, so a bucket-level permission mistake could
+# remove the lock without removing access to the state. The old table
+# definition is in git history if it is ever needed again.
 # ---------------------------------------------------------------------------
 
 resource "aws_s3_bucket" "tfstate" {
@@ -78,19 +88,4 @@ data "aws_iam_policy_document" "tfstate_tls_only" {
 resource "aws_s3_bucket_policy" "tfstate" {
   bucket = aws_s3_bucket.tfstate.id
   policy = data.aws_iam_policy_document.tfstate_tls_only.json
-}
-
-resource "aws_dynamodb_table" "tflock" {
-  name         = "${var.project}-tflock"
-  billing_mode = "PAY_PER_REQUEST" # CLAUDE.md: DynamoDB on-demand only
-  hash_key     = "LockID"
-
-  attribute {
-    name = "LockID"
-    type = "S"
-  }
-
-  lifecycle {
-    prevent_destroy = true
-  }
 }

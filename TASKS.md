@@ -41,13 +41,20 @@ worthless until it has been seen to fire.
 
 ---
 
-## Task 2 — Raw ingestion, one hour
+## Task 2 — Ingestion, one hour end to end
 
-Smallest possible slice end to end.
+One hour goes end to end: source URL to Parquet in the curated zone, both grain
+tiers, with that hour's source gz retained as part of the 48-hour regression
+fixture. Amendment 1 removed the persistent raw zone, so "write byte-identical
+source files to `raw/`" no longer stands: the only source bytes that survive are
+the fixture, and they survive for 48 hours, not forever.
 
 - Downloader respecting the 3-connection cap and the User-Agent policy
-- Converts to Parquet in flight and writes `curated/`. There is no raw zone -
-  see the SPEC storage model
+- Converts to Parquet in flight and writes both tiers under `curated/`:
+  `page_daily` for the page-days touched, and `page_hour` only where hourly
+  views are 10 or more (SPEC, two-tier curated grain)
+- That hour's source gz goes to `fixtures/raw_48h/` and nowhere else. It is a
+  format-regression fixture, not a raw zone — see the SPEC storage model
 - DynamoDB manifest, one row per hour, carrying at minimum:
   - status: pending, in-flight, done, failed
   - the source URL
@@ -59,8 +66,13 @@ Smallest possible slice end to end.
   that makes an hour re-fetchable and byte-verifiable later
 - Resumable: killing it mid-run and restarting must not duplicate or skip
 
-**Definition of done:** one hour of data is in S3, the manifest row says done,
-and re-running the downloader for that hour is a no-op.
+**Definition of done:** one hour is in `curated/` as Parquet at both tiers, the
+manifest row says done and carries its content hash, that hour's gz is in the
+48-hour fixture, and re-running the ingester for the same hour is a no-op that
+has been SEEN: killed mid-run, restarted to completion, then run a third time
+with the no-op shown in the output rather than asserted. Record the measured
+Parquet size for both tiers in `NOTES.md` — that one number sizes the whole
+backfill.
 
 ---
 
