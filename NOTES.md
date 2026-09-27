@@ -34,3 +34,31 @@ because pairing it with hourly files means two parsers and two hour conventions.
 total budget.
 
 **Breaks at 10x:** backfill stretches to ~10 days under the 3-connection cap.
+
+---
+
+## Task 1 — Account guardrails and Terraform backend
+
+**Built:** 19 resources in us-east-1 via Terraform. `terraform plan` clean
+against remote state. Estimated cost ~$0.00/month.
+
+**Which service does what:** S3 holds Terraform state (versioned, encrypted,
+TLS-only) and Athena results (7-day expiry). DynamoDB holds the state lock. AWS
+Budgets watches spend against $10, alerting at 50/80/100%. A CloudWatch alarm on
+`AWS/Billing EstimatedCharges` at $5 is a second, independent tripwire. Both
+publish to one SNS topic. The Athena workgroup enforces a 5 GiB per-query scan
+limit. IAM role `hype-decay-deploy` is the pipeline identity, assumable only by
+the human SSO admin.
+
+**Guardrail seen firing:** an unpartitioned `COUNT(*)` over a public dataset was
+cancelled at exactly 5.00 GiB — "Bytes scanned limit was exceeded"
+(`scripts/demo_scan_limit.py`). Open: the SNS subscription stays
+`PendingConfirmation` until the link is clicked.
+
+**Decision:** the deploy role leads with an explicit Deny on every forbidden
+service and every region but us-east-1. Rejected: an Allow list alone, because
+Allow lists widen as people unblock themselves, while a Deny cannot be
+overridden.
+
+**Breaks at 10x:** one state file behind one lock table serialises every apply.
+Ten pipelines would queue on that lock; split state per concern first.
