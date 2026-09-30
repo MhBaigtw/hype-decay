@@ -149,7 +149,8 @@ scope and will not be attempted.
 ## Storage model
 
 ```
-s3://<bucket>/curated/page_daily/           Parquet, Hive-partitioned dt=
+s3://<bucket>/curated/page_daily/dt=.../part-<source hour>.parquet   hourly partial
+s3://<bucket>/curated/page_daily/dt=.../day.parquet                  compacted day
 s3://<bucket>/curated/page_hour/            Parquet, Hive-partitioned dt=/hour=
 s3://<bucket>/marts/                        dbt outputs
 s3://<bucket>/fixtures/raw_48h/*.gz         48 hours of source gz, fixture only
@@ -171,6 +172,26 @@ manifest, byte-verifiable against what was originally read.
 Retain 48 hours of raw gz as a format-regression test fixture, and nothing
 more. Upstream changing its line format is the failure that fixture catches.
 
+**`page_daily` is compacted once a day is whole.** The ingester works an hour at
+a time, so it writes one partial per source hour. `ingest/compact_day.py` sums
+the 24 partials for a day into a single `day.parquet` and deletes them. Measured
+on the fixture hour, a partial is 22.7 MiB, so keeping partials for the whole
+window would cost roughly 389 GiB against 37.7 GiB for all of `page_hour` -- the
+partials, not the data, would be the bill.
+
+A day is complete when source hours `D T01`..`D T23` **and** `(D+1) T00` are all
+done. That last one is the trap: the file named `(D+1) T00` holds `D` 23:00-24:00.
+
+**The daily-views floor is applied at compaction and nowhere else.** An hour
+cannot know whether a page will clear a daily threshold, so flooring per hour
+would drop pages that qualify once the day is whole.
+
+Compaction stages the new object, deletes the partials, then puts the compacted
+object in place. That order leaves the partition briefly EMPTY rather than
+briefly DOUBLE-COUNTED: an empty partition is a visible gap, a double count is a
+silent wrong answer. The manifest day row is the authority on which days are
+compacted.
+
 **Who writes which format.** The ingester writes plain Parquet with Hive-style
 partition prefixes (`dt=`, `hour=`). Glue creates and maintains the Iceberg
 tables, in Task 4, reading what the ingester wrote.
@@ -186,6 +207,23 @@ atomic commits over the curated zone, so a reader can see a half-written day. Th
 **manifest**, not the S3 file listing, is the authority on which hours are
 complete. Task 2 wrote plain Parquet while this spec still said Iceberg; this
 paragraph replaces that silent divergence.
+
+**Task 4 ADOPTS the Parquet in place; it does not rewrite it.** Glue registers an
+Iceberg table over the files the ingester already wrote, using the `add_files`
+procedure, which writes Iceberg metadata pointing at existing objects and copies
+no data.
+
+Why not a rewrite: a CTAS into a fresh Iceberg table would hold two complete
+copies of the curated zone until the originals were deleted, roughly doubling
+curated storage for the duration. At an estimated 70 to 90 GiB curated that is
+about $2/month of transient double storage against a $30 total budget, for no
+gain in the data itself.
+
+What adoption gives up: adopted files keep the layout, file sizes and sort order
+they were written with, so Iceberg cannot retroactively improve clustering. If a
+model later needs sorted or larger files, `rewrite_data_files` can be run one
+partition at a time, so the peak extra storage is one partition rather than the
+whole table.
 
 ## v1 acceptance
 

@@ -77,3 +77,37 @@ resource "aws_athena_workgroup" "main" {
     }
   }
 }
+
+# ---------------------------------------------------------------------------
+# A second workgroup, for dbt.
+#
+# The 5 GiB interactive cap would kill the full-history dbt models: int_baselines
+# reads every page-day to compute a trailing 28-day median, which is a legitimate
+# whole-table read, not a careless one. Raising the interactive cap to fit it
+# would remove the guardrail that catches genuine mistakes, so instead there are
+# two workgroups with two stated caps, and dbt runs in this one.
+#
+# CLAUDE.md says: if a query trips the limit, fix the query, do not raise the
+# limit. That still holds. This is not a raised limit; it is a different limit
+# for a different, declared workload -- and it is still a hard stop.
+# ---------------------------------------------------------------------------
+
+resource "aws_athena_workgroup" "dbt" {
+  name        = "${var.project}-dbt"
+  description = "dbt models. Higher scan cap than interactive, still enforced."
+  state       = "ENABLED"
+
+  configuration {
+    bytes_scanned_cutoff_per_query     = var.athena_dbt_scan_limit_bytes
+    enforce_workgroup_configuration    = true
+    publish_cloudwatch_metrics_enabled = true
+
+    result_configuration {
+      output_location = "s3://${aws_s3_bucket.athena_results.bucket}/dbt-results/"
+
+      encryption_configuration {
+        encryption_option = "SSE_S3"
+      }
+    }
+  }
+}

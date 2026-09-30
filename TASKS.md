@@ -80,7 +80,17 @@ backfill.
 
 Scale Task 2 to 2 years without getting the owner's IP banned.
 
-- Sequential, throttled, resumable, restartable after days of downtime
+- Runs on the time-boxed instance, not a laptop. CLAUDE.md permits exactly one,
+  terminated on completion with a documented shutdown check
+- Fetches from the your.org mirror, which carries a byte-identical copy of the
+  same tree (sha256 verified against the origin) and is roughly 11x faster. The
+  canonical origin URL is recorded in the manifest for every hour regardless, and
+  the origin content-length is checked per file
+- Still capped at 3 connections. The cap is Wikimedia policy for the origin and
+  plain courtesy for a mirror
+- Throttled, resumable, restartable after days of downtime
+- Compacts each day as soon as its 24 hours are done, then deletes the partials.
+  Uncompacted partials are the dominant storage cost, not the data
 - Gaps logged explicitly. Wikimedia has had outages; missing hours are real
   and must be visible in the data, never silently filled
 - Progress visible without SSH — CloudWatch metric or a manifest query

@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------
-# Deployment role.
+# The deployment role. This file is the whole reason the bootstrap module exists.
 #
 # The human SSO identity is an administrator, but the pipeline is not. This role
 # is what Terraform and the pipeline assume, and it is scoped three ways:
@@ -12,6 +12,11 @@
 # time as someone adds a permission to unblock themselves; a Deny cannot be
 # overridden by a later Allow, so the expensive services stay unreachable even
 # if the Allow list grows careless.
+#
+# It also denies modifying ITSELF. Without that, a role allowed to write IAM
+# policies named hype-decay-* could rewrite its own and escape everything above.
+# The cost of that safety is real: changes to this file must be applied with the
+# admin profile, because the deploy role cannot apply them. That is the point.
 # ---------------------------------------------------------------------------
 
 data "aws_iam_policy_document" "deploy_assume" {
@@ -120,6 +125,7 @@ data "aws_iam_policy_document" "deploy" {
     resources = ["*"]
 
     # CLAUDE.md permits one small instance for the backfill and nothing larger.
+    # This condition, not the Terraform variable, is what enforces it.
     condition {
       test     = "StringEqualsIfExists"
       variable = "ec2:InstanceType"
@@ -137,6 +143,64 @@ data "aws_iam_policy_document" "deploy" {
       "ec2:TerminateInstances",
       "ec2:StopInstances",
       "ec2:Describe*",
+    ]
+
+    resources = ["*"]
+  }
+
+  statement {
+    sid    = "BackfillSupportingResources"
+    effect = "Allow"
+
+    # RunInstances alone is not enough: the instance needs a security group to
+    # sit in and an instance profile to wear.
+    actions = [
+      "ec2:CreateSecurityGroup",
+      "ec2:DeleteSecurityGroup",
+      "ec2:AuthorizeSecurityGroupEgress",
+      "ec2:RevokeSecurityGroupEgress",
+      "ec2:ModifyInstanceAttribute",
+      "ec2:ModifyInstanceMetadataOptions",
+    ]
+
+    resources = ["*"]
+  }
+
+  statement {
+    sid    = "ProjectScopedInstanceProfiles"
+    effect = "Allow"
+
+    actions = [
+      "iam:CreateInstanceProfile",
+      "iam:DeleteInstanceProfile",
+      "iam:GetInstanceProfile",
+      "iam:AddRoleToInstanceProfile",
+      "iam:RemoveRoleFromInstanceProfile",
+      "iam:TagInstanceProfile",
+      "iam:ListInstanceProfilesForRole",
+    ]
+
+    resources = [
+      "arn:aws:iam::${data.aws_caller_identity.current.account_id}:instance-profile/${var.project}-*",
+    ]
+  }
+
+  statement {
+    sid    = "SsmForAmiLookupAndRemoteCommands"
+    effect = "Allow"
+
+    # GetParameter resolves the current Amazon Linux AMI; the rest is how work
+    # gets driven on the box without opening an inbound port or holding a key.
+    actions = [
+      "ssm:GetParameter",
+      "ssm:GetParameters",
+      "ssm:SendCommand",
+      "ssm:GetCommandInvocation",
+      "ssm:ListCommandInvocations",
+      "ssm:DescribeInstanceInformation",
+      "ssm:StartSession",
+      "ssm:TerminateSession",
+      "ssm:DescribeSessions",
     ]
 
     resources = ["*"]
@@ -169,6 +233,29 @@ data "aws_iam_policy_document" "deploy" {
     ]
 
     resources = ["*"]
+  }
+
+  # --- 4b. no editing its own permissions --------------------------------
+  statement {
+    sid    = "DenySelfModification"
+    effect = "Deny"
+
+    # ProjectScopedIam above matches hype-decay-*, which includes THIS role.
+    # Without this Deny the role could attach itself a wider policy and escape
+    # every limit that is not already an explicit Deny -- the allow list would
+    # be decorative. Consequence, on purpose: this module is applied with the
+    # admin profile, not by the role itself.
+    actions = [
+      "iam:PutRolePolicy",
+      "iam:DeleteRolePolicy",
+      "iam:AttachRolePolicy",
+      "iam:DetachRolePolicy",
+      "iam:UpdateAssumeRolePolicy",
+      "iam:DeleteRole",
+      "iam:CreatePolicyVersion",
+    ]
+
+    resources = [aws_iam_role.deploy.arn]
   }
 
   # --- 5. region lock ----------------------------------------------------

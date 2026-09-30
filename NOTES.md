@@ -116,3 +116,27 @@ killed worker leaves stuck forever.
 **Breaks at 10x:** 17,520 hourly page_daily partials would be ~389 GiB. They must
 be compacted per day and the partials deleted, or curated storage alone breaks
 the $30 budget.
+
+---
+
+## Task 3 pre-design — does page_daily need every page?
+
+**Measured** (300 pages sampled from `page_daily`, strata from 1 view upward; 64
+spikes found by the SPEC definition): at a floor of 10, 2 of 64 spike baselines
+move by more than 10%; at 100, 10 of 64. Real spikes lost: 0 at every floor
+tested. False spikes created: 0 of 236 quiet pages, at every floor.
+
+**Why detection cannot break for a quiet page.** SPEC requires all three of
+`daily_views >= 1000`, `>= baseline + 500`, and `>= 5 * baseline`. For any page
+with a baseline under 200, `5 * baseline < 1000` and `baseline + 500 < 700`, so
+the absolute 1000-view floor is the binding condition. A spike day clears 1000
+by definition and is never floored. So no daily floor up to 200 can change
+whether a spike on that page is detected.
+
+**What a floor does break is magnitude, not detection.** `peak_excess =
+views(peak) - baseline/24`, so an understated baseline inflates excess and shifts
+the half-life. Two of 64 baselines moved at floor 10, which is why the floor
+stays at 0 until the bytes it saves are measured against a compacted day.
+
+**Breaks at 10x:** sampling 300 pages took 300 REST calls; a real sweep needs the
+curated table, not the API.

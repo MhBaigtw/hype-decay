@@ -38,11 +38,6 @@ output "alerts_topic_arn" {
   value       = aws_sns_topic.alerts.arn
 }
 
-output "deploy_role_arn" {
-  description = "Least-privilege role the pipeline assumes. Not for interactive use."
-  value       = aws_iam_role.deploy.arn
-}
-
 output "next_steps" {
   description = "What has to happen by hand after this apply."
   value = join("\n", [
