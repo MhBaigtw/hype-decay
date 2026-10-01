@@ -137,3 +137,29 @@ whether a spike on that page is detected.
 - baseline/24`, so an understated baseline inflates excess and shifts the
 half-life. Two of 64 baselines moved at floor 10, so the floor stays at 0 until
 the bytes it saves are measured against a compacted day.
+
+---
+
+## Task 3, mid-task — credits, the double-count guard, floor 10
+
+**Credits blinded both tripwires.** Cost Explorer, September by `RECORD_TYPE`:
+usage +$0.2414, credit −$0.2414, net zero. Budgets counted credits and read
+$0.00. `EstimatedCharges` read $0.00 too, at the total and per service, so the
+CloudWatch metric is net of credits and has no gross form. Neither guardrail
+could have fired. The budgets now exclude credits and refunds.
+
+**Double-count guard.** A partial written beside a compacted `day.parquet` is
+counted twice. The ingester refuses to write into a `compacted` or `compacting`
+day. `--force` flips the day row to `invalidated` and quarantines `day.parquet`.
+Seen on 2026-09-10: force-ingested T18, compaction refused at 1 of 24 partials,
+re-ingested the day, rebuild 190,364,968 → 190,364,968 views.
+
+**Decision: daily floor 10.** It removes 75.5% of page-days and 7.41% of views.
+The day shrinks from 92.4 MB to 24.3 MB, so 730 days come to about 16.5 GiB, and
+the dbt workgroup cap is 25 GiB. Rejected: floor 0, at 62.8 GiB. Its price is
+that baselines must zero-fill (SPEC).
+
+**Breaks at 10x:** correcting an hour re-fetches its whole day, so a parser fix
+touching many days means re-downloading them.
+
+**Code staged for the instance:** commit `COMMIT_PLACEHOLDER`.

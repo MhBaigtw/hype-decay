@@ -45,13 +45,76 @@ variable "backfill_instance_type" {
     1 core, 6.3 h on 4. Against roughly 5.0 h of download at mirror speed,
     4 cores balance the two stages, so xlarge is the choice. 8 GiB also leaves
     headroom for 4 concurrent pyarrow parses; the measurement run reports the
-    real peak RSS per worker.
+    real peak RSS per parse worker AND for compacting one day, which overlaps
+    the next day's parsing, and holds the sum against this instance's RAM.
 
     Must appear in the bootstrap module backfill_instance_types list, which is
     the IAM condition that actually enforces the ceiling.
   EOT
   type        = string
   default     = "c7g.xlarge"
+}
+
+variable "backfill_ami_id" {
+  description = <<-EOT
+    The backfill AMI, pinned. al2023-ami-2023.12.20260930.0-kernel-6.18-arm64,
+    created 2026-09-29, deprecates 2026-12-28 (still launchable by id after).
+    Changing this REPLACES the instance, so never change it while one is running.
+  EOT
+  type        = string
+  default     = "ami-065b1b834d2a83a7a"
+}
+
+variable "backfill_kernel" {
+  description = <<-EOT
+    The AL2023 kernel line backfill_ami_id must carry; checked at plan time.
+
+    6.18, chosen rather than inherited. Amazon publishes 6.1, 6.12 and 6.18
+    arm64 images with identical timestamps, and as of 2026-09-30 its own SSM
+    parameter al2023-ami-kernel-default-arm64 resolves to the 6.18 image. 6.1
+    was pinned earlier only to stop most_recent flipping between lines; pinning
+    the AMI id now does that job, so the kernel can be chosen on its merits.
+
+    The workload is one HTTP GET stream, pyarrow on four cores and S3 PUTs. It
+    needs nothing from any particular kernel, so the deciding question is which
+    line carries the least surprise, and the answer is the one Amazon ships as
+    the default and therefore tests hardest. The box lives three hours, so
+    support lifetime does not enter into it.
+  EOT
+  type        = string
+  default     = "6.18"
+}
+
+variable "backfill_python" {
+  description = "Interpreter version installed from the AL2023 repos. The system python3 is 3.9."
+  type        = string
+  default     = "3.12"
+}
+
+variable "backfill_pip_pins" {
+  description = <<-EOT
+    Exact package versions for the instance: the ones the parser regression test
+    and the Task 2 measurements ran on. Unpinned, the box would measure code the
+    laptop never ran.
+  EOT
+  type        = list(string)
+  default     = ["pyarrow==25.0.1", "boto3==1.43.103"]
+}
+
+variable "backfill_code_commit" {
+  description = <<-EOT
+    The git commit uploaded to s3://<curated>/code/, whose COMMIT file must
+    match or user_data refuses to start. Recorded in NOTES.md with the run.
+    Changing it changes user_data and so REPLACES the instance -- update it only
+    between launches.
+  EOT
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.backfill_code_commit == "" || can(regex("^[0-9a-f]{40}$", var.backfill_code_commit))
+    error_message = "backfill_code_commit must be a full 40-character commit hash."
+  }
 }
 
 variable "backfill_time_box_minutes" {

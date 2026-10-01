@@ -11,6 +11,7 @@
 
 resource "aws_s3_bucket" "athena_results" {
   bucket = "${var.project}-athena-results-${data.aws_caller_identity.current.account_id}"
+  tags   = { Task = "task-1-guardrails" }
 }
 
 resource "aws_s3_bucket_public_access_block" "athena_results" {

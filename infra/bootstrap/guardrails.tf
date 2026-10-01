@@ -11,6 +11,19 @@
 #   1. AWS Budgets watches actual month-to-date spend, billing-side.
 #   2. A CloudWatch alarm watches AWS/Billing EstimatedCharges, metric-side.
 # If one is misconfigured the other still fires.
+#
+# CREDITS BLIND BOTH OF THEM, and that was measured, not assumed. Cost Explorer
+# for September 2026, by RECORD_TYPE: Usage +0.2414 USD, Credit -0.2414 USD,
+# net zero. Every dollar of usage was netted out by credit, so a
+# budget that includes credits reads 0.00 and can never fire, however much is
+# being spent, until the credits run out. The budgets below therefore EXCLUDE
+# credits and refunds: they measure what the project consumes, which is what
+# the 30 USD ceiling is about, not what the invoice happens to say this month.
+#
+# The billing alarm cannot be fixed the same way. EstimatedCharges read 0.0 for
+# every day of September, at the total AND per service -- AmazonAthena read 0.0
+# against 0.049 USD of Athena usage -- so the metric is net of credits and has
+# no gross variant. While credits last, the alarm leg is blind by construction.
 # ---------------------------------------------------------------------------
 
 resource "aws_sns_topic" "alerts" {
@@ -108,6 +121,13 @@ resource "aws_budgets_budget" "monthly" {
   limit_unit   = "USD"
   time_unit    = "MONTHLY"
 
+  # Gross of credits and refunds -- see the header. With credits included this
+  # budget read 0.00 USD for all of September against 0.24 USD of real usage.
+  cost_types {
+    include_credit = false
+    include_refund = false
+  }
+
   dynamic "notification" {
     for_each = var.budget_alert_percentages
 
@@ -139,10 +159,18 @@ resource "aws_budgets_budget" "tripwire_test" {
   limit_unit   = "USD"
   time_unit    = "MONTHLY"
 
+  # Gross of credits and refunds -- see the header. With credits included this
+  # budget read 0.00 USD for all of September against 0.24 USD of real usage.
+  cost_types {
+    include_credit = false
+    include_refund = false
+  }
+
   # Any spend at all breaches this, so the notification fires on the next budget
-  # evaluation instead of waiting for 5 USD of real spend. Still unproven as of
-  # 2026-09-30: month-to-date cost reads -0.0000 USD, so there has been nothing
-  # to breach. Inconclusive, not failed.
+  # evaluation instead of waiting for 5 USD of real spend. It never fired
+  # through September, and now we know why: usage was 0.24 USD, but credits
+  # netted it to zero and this budget counted the credits. Excluding them, it
+  # should breach on its next evaluation.
   notification {
     comparison_operator        = "GREATER_THAN"
     threshold                  = 100
@@ -173,6 +201,10 @@ resource "aws_cloudwatch_metric_alarm" "billing" {
 
   # Missing data must not read as "fine".
   treat_missing_data = "missing"
+
+  # Net of credits, measured -- see the header. This leg starts watching real
+  # spend only once the credits are exhausted; until then the budgets above,
+  # with credits excluded, are the tripwire that can actually fire.
 
   alarm_actions = [aws_sns_topic.alerts.arn]
   ok_actions    = [aws_sns_topic.alerts.arn]

@@ -35,6 +35,34 @@ hour_start), with `views` summed across desktop and mobile.
 days, ending 2 days before the day being evaluated. The 2-day offset stops a
 spike from inflating its own baseline.
 
+**The baseline must be computed over a zero-filled date spine, not over the rows
+that exist.** `page_daily` has no row for a page-day below the 10-view floor
+(see Curated grain), and none for a page-day with zero views even without a
+floor. A median taken over existing rows silently drops exactly the quiet days
+that define a baseline.
+
+Worked example. A page's 28-day window holds 26 days at 5 views and 2 days at
+400. At floor 10 the 26 quiet days have no rows, so a median over existing rows
+is median(400, 400) = **400**, and the spike test needs `5 × 400 = 2,000` views.
+A day of 1,500 views is a real spike — the true baseline is 5, and 1,500 clears
+`5 × 5`, `5 + 500` and `1,000` — but against 400 it is missed. Zero-filled, the
+window is 26 zeros and two 400s, median **0**, and the 1,500-view day qualifies
+on the absolute floors exactly as it should.
+
+Requirements on the baseline model:
+
+- Build the spine only for **candidate pages**: any page with at least one
+  page-day of `daily_views >= 1000` in the window. A spike day must clear 1,000
+  by definition, so no other page can ever need a baseline, and a spine over
+  every page would be millions of pages × 730 days of zeros.
+- A spine day with no `page_daily` row is **0**. The error this introduces is
+  bounded by the floor: the true value was 0–9 views, so `baseline` is
+  understated by under 10 views a day and `baseline_hourly` by under 0.4.
+- A spine day whose SOURCE is incomplete — the manifest day row is not
+  `compacted`, or the compacted day was built with hours missing — is **NULL,
+  not 0**, and is left out of the median. Zero-fill stands in for a quiet page,
+  never for an outage.
+
 **`baseline_hourly`** — `baseline / 24`.
 
 **spike** — a day qualifies when all three hold:
@@ -65,9 +93,17 @@ changed how often the page is read, and hiding that is dishonest.
 
 ## Curated grain — two tiers
 
-`page_daily` is written for every English page-day.
+`page_daily` is written for every English page-day with 10 or more daily views.
+The floor is applied when the day is compacted (see Storage model); the hourly
+partials before compaction carry every page.
 
 `page_hour` is written only where hourly views are 10 or more.
+
+The daily floor removes 75.5% of page-days and 7.4% of views, and shrinks the
+compacted day 3.8x, measured on 2026-09-10 (NOTES, Task 3). It cannot hide a
+spike, because a spike day clears 1,000 views, but it does remove the quiet days
+a baseline is made of -- which is why the baseline is zero-filled (see
+Definitions).
 
 Spike qualification requires `daily_views >= 1000`, so a qualifying page has a
 half-life point far above a 10-view floor; the truncation affects only the
@@ -184,7 +220,23 @@ done. That last one is the trap: the file named `(D+1) T00` holds `D` 23:00-24:0
 
 **The daily-views floor is applied at compaction and nowhere else.** An hour
 cannot know whether a page will clear a daily threshold, so flooring per hour
-would drop pages that qualify once the day is whole.
+would drop pages that qualify once the day is whole. The floor is 10. A
+compacted day can be refloored HIGHER from its own `day.parquet`; it can never
+be refloored lower, because the rows under the old floor exist only at the
+source, so lowering a floor is a re-ingest.
+
+**A compacted day is closed to partials.** `day.parquet` already holds every
+hour of the day, so a partial written beside it is counted twice by anything
+that lists the partition, and the total looks entirely plausible. The ingester
+refuses to write a partial into a day whose manifest day row is `compacted` or
+`compacting`. A forced re-ingest of an hour in a compacted day first flips the
+day row to `invalidated` and moves `day.parquet` out of the partition into a
+quarantine prefix, so the partition reads as a gap until the day is rebuilt.
+Rebuilding needs all 24 partials, and compaction deleted 23 of them, so
+invalidating a day means re-ingesting the whole day. The compactor rebuilds
+only from the 24 expected partial keys, refuses if a compacted object sits
+beside them, and checks the rebuilt day's rows and views against the totals the
+invalidation recorded.
 
 Compaction stages the new object, deletes the partials, then puts the compacted
 object in place. That order leaves the partition briefly EMPTY rather than

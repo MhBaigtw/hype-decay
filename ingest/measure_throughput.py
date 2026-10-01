@@ -7,7 +7,18 @@ Answers what Task 3 design needs:
   * wall-clock for all 17,520 hours
   * whether the binding constraint is the connection cap or the processing
   * peak memory per parse worker, which decides how many workers fit in RAM
+  * peak memory of COMPACTING one day, which runs alongside the parse workers
   * instance cost at that duration
+
+MEASURES THE REAL CODE. Parse workers call ingest_hour.parse() and build_tiers()
+and write a real page_daily partial; the compaction stage calls
+compact_day.aggregate_arrow() on those partials and applies the floor. An
+earlier version carried its own copy of the parse and stopped before
+build_tiers, which builds Python lists of every title and is a real share of a
+worker's memory.
+
+ONE WHOLE DAY BY DEFAULT. The sample is source hours D T01 .. (D+1) T00, which
+is exactly one compactable day, so stage 3 compacts what the backfill would.
 
 MEASURED IN TWO STAGES, ON PURPOSE. Download and parse are timed separately
 rather than as one pipeline, because a single end-to-end number cannot tell you
@@ -16,6 +27,10 @@ which stage to fix. The overlapped wall clock is then derived as
     max(total_download_time, total_parse_time / parse_workers)
 
 which is what a pipelined runner would actually achieve.
+
+Compaction of day D overlaps the parsing of day D+1 in the real backfill, so the
+memory that must fit is parse_workers x parse peak + compaction peak, and that
+is the figure the report holds against the instance's RAM.
 
 Downloads run in THREADS capped at 3, because the limit is network politeness:
 Wikimedia allows 3 connections per IP and blocks clients that evade it, and a
@@ -34,7 +49,7 @@ Laptop reference figures (2026-09-27):
 Nothing is written to S3 and the manifest is never touched: this measures, it
 does not ingest.
 
-    python3 measure_throughput.py --hours 20 --download-workers 3 --parse-workers 4
+    python3 measure_throughput.py --download-workers 3 --parse-workers 4
 """
 
 import argparse
@@ -49,8 +64,9 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from collections import Counter
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 SOURCES = {
     "your.org": "https://dumps.wikimedia.your.org/other/pageviews",
@@ -73,6 +89,12 @@ INSTANCE_HOURLY_USD = {
     "c8g.large": 0.0798, "c8g.xlarge": 0.1595, "t4g.small": 0.0168,
 }
 EBS_GP3_USD_PER_GIB_MONTH = 0.08
+
+# Memory, GiB, from the EC2 instance type specs.
+INSTANCE_RAM_GIB = {
+    "c7g.medium": 2, "c7g.large": 4, "c7g.xlarge": 8,
+    "c8g.large": 4, "c8g.xlarge": 8, "t4g.small": 2,
+}
 
 
 def peak_rss_mib():
@@ -129,55 +151,69 @@ def download_one(args):
 
 
 def parse_one(path):
-    """Parse one hour with pyarrow. Runs in its own PROCESS, reports own RSS."""
-    import pyarrow as pa
-    import pyarrow.compute as pc
-    import pyarrow.csv as pacsv
+    """Parse one hour with the ingester's own code, in its own PROCESS.
 
-    skipped = Counter()
+    Writes the page_daily partial next to the gz, exactly as the ingester would
+    before uploading it, so stage 3 can compact real partials.
+    """
+    import ingest_hour
 
-    def on_invalid_row(row):
-        skipped["invalid"] += 1
-        return "skip"
+    name = Path(path).name                    # pageviews-YYYYMMDD-HH0000.gz
+    source_hour = dt.datetime.strptime(name[10:21], "%Y%m%d-%H").replace(
+        tzinfo=dt.timezone.utc)
+    hour_start = ingest_hour.hour_start_of(source_hour)
 
     started = time.time()
-    table = pacsv.read_csv(
-        path,
-        read_options=pacsv.ReadOptions(
-            column_names=["domain", "title", "views", "bytes"]),
-        parse_options=pacsv.ParseOptions(
-            delimiter=" ", quote_char=False, invalid_row_handler=on_invalid_row),
-        convert_options=pacsv.ConvertOptions(column_types={
-            "domain": pa.binary(), "title": pa.binary(),
-            "views": pa.binary(), "bytes": pa.binary()}),
-    )
-    english = table.filter(pc.is_in(
-        table.column("domain"),
-        value_set=pa.array([b"en", b"en.m"], pa.binary())))
-    # Digit test on binary, not on a string cast: the cast validates UTF-8 over
-    # the whole column and would fail the file over one stray byte.
-    numeric = pc.match_substring_regex(english.column("views"), r"^[0-9]+$")
-    english = english.filter(numeric)
-    views = pc.cast(pc.cast(english.column("views"), pa.string()), pa.int64())
-    grouped = (pa.table({"title": english.column("title"), "views": views})
-               .group_by("title").aggregate([("views", "sum")]))
+    views_by_title, stats = ingest_hour.parse(path)
+    _, page_daily = ingest_hour.build_tiers(views_by_title, hour_start)
+    partial = Path(path).with_suffix(".daily.parquet")
+    partial_bytes = ingest_hour.write_parquet(
+        page_daily, ingest_hour.PAGE_DAILY_SCHEMA, partial)
     secs = time.time() - started
 
-    return {"path": path, "secs": round(secs, 2), "titles": grouped.num_rows,
-            "views": pc.sum(grouped.column("views_sum")).as_py(),
+    return {"path": path, "partial": str(partial), "partial_bytes": partial_bytes,
+            "day": str(hour_start.date()), "secs": round(secs, 2),
+            "titles": len(views_by_title), "views": stats["views_kept"],
             "peak_rss_mib": round(peak_rss_mib(), 1), "pid": os.getpid(),
-            "skipped_invalid": skipped["invalid"]}
+            "skipped_invalid": stats["rows_skipped_invalid"]}
+
+
+def compact_one(partials, day, floor):
+    """Compact one day of partials with compact_day's own code, in a FRESH
+    process, so its peak is not inherited from a parse worker."""
+    import io
+
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    import compact_day
+
+    started = time.time()
+    bodies = [Path(p).read_bytes() for p in partials]
+    compacted = compact_day.aggregate_arrow(bodies, dt.date.fromisoformat(day))
+    rows_unfloored = compacted.num_rows
+    compacted = compacted.filter(pc.greater_equal(compacted.column("views"), floor))
+    buf = io.BytesIO()
+    pq.write_table(compacted, buf, compression="snappy")
+    return {"secs": round(time.time() - started, 2), "partials": len(partials),
+            "input_bytes": sum(len(b) for b in bodies),
+            "rows_unfloored": rows_unfloored, "rows": compacted.num_rows,
+            "bytes": buf.tell(), "peak_rss_mib": round(peak_rss_mib(), 1)}
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
-    ap.add_argument("--hours", type=int, default=20)
+    ap.add_argument("--hours", type=int, default=24,
+                    help="24 ending at --last-hour T00 is exactly one compactable day")
     ap.add_argument("--download-workers", type=int, default=3,
                     help=f"concurrent connections, hard cap {MAX_CONNECTIONS}")
     ap.add_argument("--parse-workers", type=int, default=4,
                     help="parse processes; set to the vCPU count")
     ap.add_argument("--source", choices=sorted(SOURCES), default="your.org")
-    ap.add_argument("--last-hour", default="2026-09-10T18")
+    ap.add_argument("--last-hour", default="2026-09-11T00",
+                    help="source hour (D+1)T00 closes day D")
+    ap.add_argument("--floor", type=int, default=10,
+                    help="the compaction floor, as compact_day.py applies it")
     ap.add_argument("--instance-type", default="c7g.xlarge")
     ap.add_argument("--keep-files", action="store_true")
     args = ap.parse_args()
@@ -251,6 +287,41 @@ def main():
     print(f"    {args.parse_workers} workers at the max => "
           f"{max(peaks) * args.parse_workers / 1024:.2f} GiB resident")
 
+    # --- stage 3: compact ---------------------------------------------------
+    days = {}
+    for row in parsed:
+        days.setdefault(row["day"], []).append(row["partial"])
+    whole = {d: ps for d, ps in days.items() if len(ps) == 24}
+    compaction = None
+    if whole:
+        day, partials = sorted(whole.items())[0]
+        print(f"\n  STAGE 3: compact {day} (24 partials, floor {args.floor}) "
+              f"in a fresh process")
+        with futures.ProcessPoolExecutor(max_workers=1) as pool:
+            compaction = pool.submit(compact_one, partials, day, args.floor).result()
+        print(f"    {compaction['secs']:.1f}s, {compaction['input_bytes'] / 2 ** 20:,.0f} "
+              f"MiB of partials -> {compaction['rows_unfloored']:,} pages, "
+              f"{compaction['rows']:,} after floor, "
+              f"{compaction['bytes'] / 2 ** 20:,.1f} MiB")
+        print(f"    PEAK MEMORY, COMPACTION: {compaction['peak_rss_mib']:,.1f} MiB")
+    else:
+        print("\n  STAGE 3: skipped -- no day has all 24 partials in this sample.")
+        print("  Use --hours 24 with --last-hour on a T00 to cover one whole day.")
+
+    # --- memory verdict -----------------------------------------------------
+    ram_gib = INSTANCE_RAM_GIB.get(args.instance_type)
+    print("\n  MEMORY, side by side (peak RSS, MiB)")
+    print(f"    parse worker, max of {len(by_pid)}       : {max(peaks):9,.1f}")
+    if compaction:
+        print(f"    compaction, one day            : {compaction['peak_rss_mib']:9,.1f}")
+        worst = max(peaks) * args.parse_workers + compaction["peak_rss_mib"]
+        print(f"    {args.parse_workers} parse + 1 compaction, overlapped: "
+              f"{worst:9,.1f}  ({worst / 1024:.2f} GiB)")
+        if ram_gib:
+            verdict = "FITS" if worst / 1024 < ram_gib * 0.85 else "DOES NOT FIT"
+            print(f"    {args.instance_type} has {ram_gib} GiB: {verdict}, keeping 15% "
+                  f"for the OS and page cache")
+
     # --- extrapolate -------------------------------------------------------
     scale = TOTAL_HOURS / len(good)
     download_full_h = download_wall * scale / 3600
@@ -290,6 +361,8 @@ def main():
     if not args.keep_files:
         for row in good:
             Path(row["path"]).unlink(missing_ok=True)
+        for row in parsed:
+            Path(row["partial"]).unlink(missing_ok=True)
         Path(workdir).rmdir()
         print(f"\n  cleaned up {workdir}")
     return 0

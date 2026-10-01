@@ -228,6 +228,116 @@ class Manifest:
             ExpressionAttributeValues={":failed": "failed", ":reason": str(reason)[:900]},
         )
 
+    def invalidate_day(self, day, hour_key):
+        """compacted -> invalidated, atomically. False if the row was not compacted.
+
+        The previous totals are copied inside the same write (SET x = y reads the
+        item being updated), so the recompaction can be checked against exactly
+        what this invalidation replaced.
+        """
+        try:
+            self.table.update_item(
+                Key={"source_hour": f"day#{day}"},
+                UpdateExpression=(
+                    "SET #s = :inv, invalidated_by = :hour, invalidated_at = :now, "
+                    "views_previous = #v, rows_previous = #r, key_quarantine = :q"),
+                ConditionExpression="#s = :compacted",
+                ExpressionAttributeNames={"#s": "status", "#v": "views", "#r": "rows"},
+                ExpressionAttributeValues={
+                    ":inv": "invalidated", ":compacted": "compacted",
+                    ":hour": hour_key, ":q": quarantine_key(day),
+                    ":now": dt.datetime.now(dt.timezone.utc).isoformat()},
+            )
+            return True
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                return False
+            raise
+
+
+# --- the double-count guard ------------------------------------------------
+#
+# A compacted day.parquet already holds all 24 hours of its day. A fresh partial
+# written next to it is counted twice by anything that lists the partition, and
+# the result looks entirely plausible. So the ingester never writes a partial
+# into a day whose day# row is compacted or compacting.
+#
+# --force is the one way in, and it pays for it: the day row flips to
+# invalidated and day.parquet is moved out of the readable partition, so the
+# partition reads as a GAP until the day is rebuilt -- the same "empty, never
+# double" rule compaction follows. The compacted copy is quarantined rather than
+# deleted, because until the day is rebuilt it is the only copy of the other 23
+# hours. Rebuilding needs all 24 partials, so invalidating a compacted day means
+# re-ingesting the whole day, not one hour of it.
+
+class DayGuardRefused(Exception):
+    pass
+
+
+def day_object_key(day):
+    return f"curated/page_daily/dt={day}/day.parquet"
+
+
+def quarantine_key(day):
+    # Outside curated/page_daily/, so no reader of the table prefix can see it.
+    return f"curated/_invalidated/page_daily/dt={day}/day.parquet"
+
+
+def _s3_exists(s3, bucket, key):
+    try:
+        s3.head_object(Bucket=bucket, Key=key)
+        return True
+    except ClientError as e:
+        if e.response["Error"]["Code"] in ("404", "NoSuchKey", "NotFound"):
+            return False
+        raise
+
+
+def quarantine_day_object(s3, bucket, day):
+    """Moves day.parquet out of the partition. Idempotent: copy, then delete."""
+    live = day_object_key(day)
+    if not _s3_exists(s3, bucket, live):
+        return False
+    s3.copy_object(Bucket=bucket, Key=quarantine_key(day),
+                   CopySource={"Bucket": bucket, "Key": live})
+    s3.delete_object(Bucket=bucket, Key=live)
+    return True
+
+
+def guard_day(manifest, s3, bucket, day, hour_key, force):
+    """Decides whether a partial for `hour_key` may be written into `day`.
+
+    Returns "open" or "invalidated"; raises DayGuardRefused otherwise. Must run
+    immediately before the partial is uploaded, not just at start-up, because a
+    compaction can begin while this hour is downloading.
+    """
+    row = manifest.get(f"day#{day}") or {}
+    status = row.get("status")
+
+    if status == "compacting":
+        # Compaction owns the partition until it finishes or is recovered.
+        # Force does not override this: writing now would race the placement.
+        raise DayGuardRefused(
+            f"day {day} is compacting; re-run compact_day.py to finish it first")
+
+    if status == "compacted":
+        if not force:
+            raise DayGuardRefused(
+                f"day {day} is compacted: a partial here would be counted twice. "
+                f"Pass --force to invalidate the day and rebuild it")
+        if not manifest.invalidate_day(day, hour_key):
+            # The row changed under us. Decide again on what it is now.
+            return guard_day(manifest, s3, bucket, day, hour_key, force)
+        quarantine_day_object(s3, bucket, day)
+        return "invalidated"
+
+    if status == "invalidated":
+        # Finishes a quarantine that a crash interrupted, so a partial never
+        # lands beside a compacted object that should already have moved.
+        quarantine_day_object(s3, bucket, day)
+
+    return "open"
+
 
 # --- download --------------------------------------------------------------
 
@@ -449,6 +559,21 @@ def run(args):
         log("Nothing was downloaded and nothing was written. Pass --force to redo it.")
         return 0
 
+    # Early refusal, before a byte is downloaded. guard_day() runs again right
+    # before upload, which is the check that counts; this one saves a wasted
+    # transfer when the answer is already no.
+    day = hour_start.date()
+    day_status = (manifest.get(f"day#{day}") or {}).get("status", "none")
+    log(f"day row  : day#{day} is {day_status}")
+    if day_status == "compacting" or (day_status == "compacted" and not args.force):
+        log(f"REFUSED: a partial for {key} cannot go into a {day_status} day. "
+            + ("Finish the compaction first." if day_status == "compacting"
+               else "Pass --force to invalidate and rebuild the day."))
+        return 4
+    if day_status == "compacted":
+        log("--force on a compacted day: the day will be INVALIDATED before upload, "
+            "and needs all 24 hours re-ingested to be rebuilt")
+
     if args.dry_run:
         # A dry run must not touch the manifest. Reading and parsing an hour is
         # not the same as claiming it, and a dry run that left a row in-flight
@@ -555,6 +680,10 @@ def run(args):
             return 0
 
         print()
+        action = guard_day(manifest, s3, args.bucket, day, key, args.force)
+        if action == "invalidated":
+            log(f"day#{day} INVALIDATED; day.parquet moved to "
+                f"s3://{args.bucket}/{quarantine_key(day)}")
         log("uploading...")
         for local, s3_key in ((hour_path, hour_key), (daily_path, daily_key),
                               (gz_path, fixture_key)):
@@ -616,7 +745,8 @@ def main():
     ap.add_argument("--region", default=DEFAULT_REGION)
     ap.add_argument("--profile", default=os.environ.get("AWS_PROFILE"))
     ap.add_argument("--force", action="store_true",
-                    help="re-process an hour the manifest already calls done")
+                    help="re-process an hour the manifest already calls done; in a "
+                         "compacted day this INVALIDATES the day")
     ap.add_argument("--dry-run", action="store_true",
                     help="download and parse, but write nothing and touch no state")
     args = ap.parse_args()

@@ -90,8 +90,21 @@ variable "athena_dbt_scan_limit_bytes" {
   description = <<-EOT
     Per-query scan limit for the dbt workgroup, deliberately higher than the
     interactive cap because the baseline model legitimately reads the whole
-    page_daily history. Set from the measured compacted table size; see NOTES.
+    page_daily history.
+
+    25 GiB, from measurement. 2026-09-10 compacted at floor 10 is 24,256,661
+    bytes, all five columns (page_title alone is 20.5 MB of it). Over 730 days
+    that is 16.5 GiB for a full read of every column; 25 GiB is 1.5x of that.
+    The earlier 64 GiB was the FLOOR 0 projection (92.4 MB a day), which the
+    floor made 3.8x too generous.
+
+    What the cap assumes: no single dbt query reads page_daily more than once.
+    The baseline needs the candidate pages AND their history, which written as
+    one query is two full scans, about 33 GiB, and would trip this. Candidate
+    pages are therefore their own model, so each query scans the table once.
+    If a query trips the cap, fix the query (CLAUDE.md); re-measure this only if
+    the backfilled table turns out larger than 16.5 GiB.
   EOT
   type        = number
-  default     = 68719476736 # 64 GiB
+  default     = 26843545600 # 25 GiB
 }

@@ -28,30 +28,45 @@ data "aws_subnets" "default" {
   }
 }
 
-# Amazon Linux 2023 for arm64, resolved at plan time rather than pinned to an
-# AMI id that goes stale.
+# The AMI is PINNED by id (var.backfill_ami_id), not resolved at plan time.
 #
-# This was an SSM public-parameter lookup first, and it failed: there is no
-# /aws/service/ami-al2023-latest namespace, and public parameter paths cannot be
-# enumerated to find the right one because GetParametersByPath rejects /aws/
-# outright. describe-images needs nothing beyond the ec2:Describe* the deploy
-# role already has, and the result can be read back and checked by hand.
+# A most_recent lookup makes the AMI id a function of the day you plan. Amazon
+# published a new AL2023 set on 2026-09-29, so a plan run the day after launch
+# would have shown a new id, and a changed ami on aws_instance is a forced
+# REPLACEMENT: one careless apply mid-transfer and the box is destroyed and
+# relaunched. Pinned, the instance changes only when someone edits the variable,
+# and the plan says so.
 #
-# The filter pins the 6.1 kernel line deliberately. Amazon publishes 6.1 and
-# 6.12 arm64 AMIs with identical creation dates, so an unpinned most_recent
-# would flip kernel versions between plans for no stated reason.
-data "aws_ami" "al2023_arm64" {
-  most_recent = true
-  owners      = ["amazon"]
+# This data source does not choose the image. It looks up the pinned id and
+# fails the plan if that id is not what the variable claims: Amazon-owned,
+# arm64, and the kernel line chosen below.
+#
+# Correction to an earlier comment here, which said there is no SSM public
+# parameter for AL2023. There is:
+#   /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+# The lookup that "failed" was most likely run from Git Bash, which rewrites a
+# leading /aws/... into a Windows path before the CLI sees it -- reproduced on
+# 2026-09-30: ParameterNotFound from Git Bash, the AMI id with MSYS_NO_PATHCONV=1.
+# The parameter is useful for picking the next id by hand; it is still not
+# used here, because any latest-pointer reintroduces the replacement risk above.
+data "aws_ami" "backfill" {
+  owners             = ["amazon"]
+  include_deprecated = true # pinned ids deprecate after ~90 days; still launchable
 
   filter {
-    name   = "name"
-    values = ["al2023-ami-2*-kernel-6.1-arm64"]
+    name   = "image-id"
+    values = [var.backfill_ami_id]
   }
 
-  filter {
-    name   = "state"
-    values = ["available"]
+  lifecycle {
+    postcondition {
+      condition     = self.architecture == "arm64"
+      error_message = "backfill_ami_id must be an arm64 image: the instance type is Graviton."
+    }
+    postcondition {
+      condition     = can(regex("^al2023-ami-2023\\.[0-9.]+-kernel-${replace(var.backfill_kernel, ".", "\\.")}-arm64$", self.name))
+      error_message = "backfill_ami_id is not an AL2023 kernel-${var.backfill_kernel} arm64 image."
+    }
   }
 }
 
@@ -61,6 +76,7 @@ resource "aws_security_group" "backfill" {
   name        = "${var.project}-backfill"
   description = "Backfill instance. Egress only; nothing may connect inbound."
   vpc_id      = data.aws_vpc.default.id
+  tags        = { Task = "task-3-backfill" }
 
   # No ingress rules at all. Access is through SSM Session Manager, which works
   # outbound-only, so there is no SSH port and no key pair to leak.
@@ -91,6 +107,7 @@ resource "aws_iam_role" "backfill" {
   name               = "${var.project}-backfill"
   description        = "Identity of the backfill instance. Narrower than the deploy role."
   assume_role_policy = data.aws_iam_policy_document.backfill_assume.json
+  tags               = { Task = "task-3-backfill" }
 }
 
 data "aws_iam_policy_document" "backfill" {
@@ -177,6 +194,7 @@ resource "aws_iam_role_policy_attachment" "backfill_ssm" {
 resource "aws_iam_instance_profile" "backfill" {
   name = "${var.project}-backfill"
   role = aws_iam_role.backfill.name
+  tags = { Task = "task-3-backfill" }
 }
 
 # --- the instance itself ---------------------------------------------------
@@ -193,23 +211,37 @@ locals {
     # goes too. ${var.backfill_time_box_minutes} minutes is the time box.
     shutdown -h +${var.backfill_time_box_minutes}
 
-    dnf -y install python3-pip
-    python3 -m pip install --quiet boto3 pyarrow
+    # The system python3 on AL2023 is 3.9, and an unpinned pip install there
+    # resolves to whatever old pyarrow still supports 3.9 -- not the version
+    # the parser was verified on. So: a current interpreter, pinned packages.
+    dnf -y install python${var.backfill_python} python${var.backfill_python}-pip
+    python${var.backfill_python} -m pip install --quiet ${join(" ", var.backfill_pip_pins)}
 
     mkdir -p /opt/${var.project}
     aws s3 cp s3://${aws_s3_bucket.curated.bucket}/code/ /opt/${var.project}/ \
       --recursive --region ${var.region}
     chmod -R a+rx /opt/${var.project}
 
+    # Refuse to run code other than the commit this launch was planned with.
+    # Without this check, whatever was last uploaded to code/ is what runs, and
+    # nothing records which commit produced the backfill.
+    got="$(cat /opt/${var.project}/COMMIT)"
+    if [ "$got" != "${var.backfill_code_commit}" ]; then
+      echo "code/ holds $got, expected ${var.backfill_code_commit}" > /opt/${var.project}/WRONG_CODE
+      exit 1
+    fi
+
     # Marker the operator can poll for, so "is it ready" has a real answer.
-    date -u +%FT%TZ > /opt/${var.project}/READY
+    { date -u +%FT%TZ; echo "commit $got"; uname -r; python${var.backfill_python} -c \
+      'import pyarrow, boto3; print("pyarrow", pyarrow.__version__, "boto3", boto3.__version__)'; } \
+      > /opt/${var.project}/READY
   BASH
 }
 
 resource "aws_instance" "backfill" {
   count = local.backfill_count
 
-  ami           = data.aws_ami.al2023_arm64.id
+  ami           = data.aws_ami.backfill.id
   instance_type = var.backfill_instance_type
   subnet_id     = data.aws_subnets.default.ids[0]
 
@@ -221,6 +253,13 @@ resource "aws_instance" "backfill" {
 
   user_data                   = local.backfill_user_data
   user_data_replace_on_change = true
+
+  lifecycle {
+    precondition {
+      condition     = var.backfill_code_commit != ""
+      error_message = "Set backfill_code_commit to the commit uploaded to code/ before launching."
+    }
+  }
 
   root_block_device {
     volume_size           = 20
@@ -235,7 +274,9 @@ resource "aws_instance" "backfill" {
 
   tags = {
     Name       = "${var.project}-backfill"
+    Task       = "task-3-backfill"
     TimeBoxMin = tostring(var.backfill_time_box_minutes)
+    CodeCommit = var.backfill_code_commit
   }
 }
 
