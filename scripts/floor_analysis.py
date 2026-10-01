@@ -43,6 +43,12 @@ POLITE_DELAY_SEC = 0.3  # REST API, not the dumps server; still be polite
 DEFAULT_BUCKET = "hype-decay-curated-820697996849"
 CANDIDATE_FLOORS = (1, 5, 10, 25, 50, 100)
 
+# The 2-year window Task 0 measured: 730 days, 17,520 hours.
+DAYS_IN_WINDOW = 730
+
+# Athena bills per byte scanned, 5 USD per TiB, 10 MB minimum per query.
+ATHENA_USD_PER_TIB = 5.0
+
 # SPEC spike definition.
 BASELINE_DAYS = 28
 BASELINE_OFFSET_DAYS = 2
@@ -281,12 +287,14 @@ def distribution(args):
           f"{'bytes kept':>11}  {'views kept':>11}")
     print("  " + "-" * 72)
     base_bytes = base_rows = None
+    day = date.fromisoformat(args.dt)
+    schema = pa.schema([("project", pa.string()), ("page_title", pa.string()),
+                        ("dt", pa.date32()), ("views", pa.int64()),
+                        ("hours_present", pa.int32())])
+    per_floor = {}
+    all_views = sum(totals.values())
     for floor in (0,) + CANDIDATE_FLOORS:
         kept = {t: v for t, v in totals.items() if v >= floor}
-        schema = pa.schema([("project", pa.string()), ("page_title", pa.string()),
-                            ("dt", pa.date32()), ("views", pa.int64()),
-                            ("hours_present", pa.int32())])
-        day = date.fromisoformat(args.dt)
         buf = io.BytesIO()
         pq.write_table(pa.Table.from_pydict({
             "project": ["en.wikipedia"] * len(kept),
@@ -296,14 +304,55 @@ def distribution(args):
             "hours_present": [24] * len(kept),
         }, schema=schema), buf, compression="snappy")
         size = buf.tell()
+
+        # Per-column compressed bytes, straight from the Parquet footer. Athena
+        # bills what it SCANS, and a column-pruned query does not read the whole
+        # file, so a scan estimate built on total file size is wrong by whatever
+        # the unused columns weigh.
+        buf.seek(0)
+        meta = pq.ParquetFile(buf).metadata
+        columns = {}
+        for rg in range(meta.num_row_groups):
+            group = meta.row_group(rg)
+            for col in range(group.num_columns):
+                chunk = group.column(col)
+                name = chunk.path_in_schema
+                columns[name] = columns.get(name, 0) + chunk.total_compressed_size
+        baseline_cols = sum(columns.get(c, 0) for c in ("page_title", "dt", "views"))
+        per_floor[floor] = {"rows": len(kept), "bytes": size,
+                            "views": sum(kept.values()), "columns": columns,
+                            "baseline_bytes": baseline_cols}
+
         if base_bytes is None:
             base_bytes, base_rows = size, len(kept)
         print(f"  {floor:>6}  {len(kept):>12,}  {100 * len(kept) / base_rows:>9.1f}%  "
               f"{size / 2 ** 20:>9,.1f} MiB  {100 * size / base_bytes:>10.1f}%  "
-              f"{100 * sum(kept.values()) / sum(totals.values()):>10.2f}%")
+              f"{100 * sum(kept.values()) / all_views:>10.2f}%")
+
     print()
-    log("Compare the bytes-kept column against what compaction alone saves:")
-    log("24 partials into 1 object removes duplication, a floor removes pages.")
+    log("per-column compressed bytes at floor 0 (what a pruned query can avoid):")
+    for name, size in sorted(per_floor[0]["columns"].items(), key=lambda kv: -kv[1]):
+        log(f"    {name:<14} {size / 2 ** 20:7.1f} MiB")
+
+    print()
+    print(f"  dbt BASELINE MODEL scan estimate: it reads page_title, dt and views")
+    print(f"  across the whole window, so {DAYS_IN_WINDOW} days of those columns.")
+    print()
+    print(f"  {'floor':>6}  {'1 day, 3 cols':>15}  {'x730 full table':>17}  "
+          f"{'fits 5 GiB?':>12}  {'athena $/run':>13}")
+    print("  " + "-" * 74)
+    for floor in (0,) + CANDIDATE_FLOORS:
+        day_bytes = per_floor[floor]["baseline_bytes"]
+        full = day_bytes * DAYS_IN_WINDOW
+        fits = "yes" if full <= 5 * 1024 ** 3 else "NO"
+        print(f"  {floor:>6}  {day_bytes / 2 ** 20:12,.1f} MiB  "
+              f"{full / 2 ** 30:14,.1f} GiB  {fits:>12}  "
+              f"${full / 1024 ** 4 * ATHENA_USD_PER_TIB:12.2f}")
+
+    print()
+    log("Compaction and a floor are not alternatives: compaction removes")
+    log("duplication between 24 partials, a floor removes pages. Compaction is")
+    log("mandatory; a floor is a judgement about the tail.")
     return 0
 
 

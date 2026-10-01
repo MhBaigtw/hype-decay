@@ -225,6 +225,20 @@ model later needs sorted or larger files, `rewrite_data_files` can be run one
 partition at a time, so the peak extra storage is one partition rather than the
 whole table.
 
+**`add_files` runs on compacted days only, and adoption is one-way.** A day is
+eligible once `compact_day.py` has replaced its 24 partials with one object and
+the manifest `day#` row says `compacted`. Adopting a day that is still partials
+would register 24 files that compaction is about to delete, and Iceberg metadata
+pointing at deleted files is a broken table, not a stale one.
+
+**Once Iceberg owns a table, nothing deletes files behind it.** Compaction
+deletes partials, so compaction must finish BEFORE adoption, never after. From
+the moment a table is adopted, new days are written THROUGH Iceberg -- an Iceberg
+append, not a bare PUT followed by `add_files` -- because a file that appears in
+S3 without a metadata commit is invisible to readers, and a file removed without
+one makes every snapshot that references it unreadable. The manifest stays the
+record of what was fetched; Iceberg becomes the record of what is queryable.
+
 ## v1 acceptance
 
 v1 is done when all of these are true:

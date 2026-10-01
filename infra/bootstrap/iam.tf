@@ -48,7 +48,6 @@ data "aws_iam_policy_document" "deploy" {
     # CLAUDE.md allow list. ECS Fargate and Kinesis Firehose are deliberately
     # absent: they become allowed at v3, not now.
     actions = [
-      "s3:*",
       "glue:*",
       "athena:*",
       "lambda:*",
@@ -65,6 +64,29 @@ data "aws_iam_policy_document" "deploy" {
       "ce:Get*",
     ]
 
+    resources = ["*"]
+  }
+
+  # --- 1b. S3, scoped to this project -------------------------------------
+  statement {
+    sid    = "ProjectBuckets"
+    effect = "Allow"
+
+    # s3:* but only on buckets named for this project, including ones that do
+    # not exist yet (marts, the web bucket). A bare s3:* on "*" would include
+    # the state bucket, and with it the bootstrap state that defines this role.
+    actions = ["s3:*"]
+
+    resources = [
+      "arn:aws:s3:::${var.project}-*",
+      "arn:aws:s3:::${var.project}-*/*",
+    ]
+  }
+
+  statement {
+    sid       = "ListBucketsForTooling"
+    effect    = "Allow"
+    actions   = ["s3:ListAllMyBuckets", "s3:GetBucketLocation"]
     resources = ["*"]
   }
 
@@ -235,7 +257,66 @@ data "aws_iam_policy_document" "deploy" {
     resources = ["*"]
   }
 
-  # --- 4b. no editing its own permissions --------------------------------
+  # --- 4a. the bootstrap state is off limits ------------------------------
+  statement {
+    sid    = "DenyBootstrapState"
+    effect = "Deny"
+
+    # ProjectBuckets above matches hype-decay-tfstate-* too, which it must: the
+    # deploy role needs the main module state under guardrails/. It has no
+    # business in bootstrap/, which holds the state that defines its own
+    # permissions. A corrupted bootstrap state is how a constrained role stops
+    # being constrained.
+    actions   = ["s3:*"]
+    resources = ["arn:aws:s3:::${var.project}-tfstate-*/bootstrap/*"]
+  }
+
+  # --- 4b. the guardrails cannot be touched by the deployer ---------------
+  statement {
+    sid    = "DenyGuardrailTampering"
+    effect = "Deny"
+
+    # A budget the deployer can delete is a budget on a timer, and a scan limit
+    # it can raise is not a limit. These resources are owned by this module and
+    # applied by a human; the pipeline identity may read them and nothing else.
+    actions = [
+      "budgets:ModifyBudget",
+      "budgets:DeleteBudget",
+      "cloudwatch:DeleteAlarms",
+      "cloudwatch:PutMetricAlarm",
+      "cloudwatch:DisableAlarmActions",
+      "cloudwatch:SetAlarmState",
+      "sns:DeleteTopic",
+      "sns:SetTopicAttributes",
+      "sns:AddPermission",
+      "sns:RemovePermission",
+      "athena:DeleteWorkGroup",
+      "athena:UpdateWorkGroup",
+    ]
+
+    resources = [
+      "arn:aws:budgets::${data.aws_caller_identity.current.account_id}:budget/${var.project}-monthly",
+      "arn:aws:budgets::${data.aws_caller_identity.current.account_id}:budget/${var.project}-tripwire-test",
+      "arn:aws:cloudwatch:${var.region}:${data.aws_caller_identity.current.account_id}:alarm:${var.project}-estimated-charges",
+      "arn:aws:sns:${var.region}:${data.aws_caller_identity.current.account_id}:${var.project}-alerts",
+      "arn:aws:athena:${var.region}:${data.aws_caller_identity.current.account_id}:workgroup/${var.project}",
+      "arn:aws:athena:${var.region}:${data.aws_caller_identity.current.account_id}:workgroup/${var.project}-dbt",
+    ]
+  }
+
+  statement {
+    sid    = "DenyUnsubscribingAlerts"
+    effect = "Deny"
+
+    # Deliberately unscoped: sns:Unsubscribe takes a SUBSCRIPTION arn, which is
+    # generated per subscription and cannot be predicted here. The deploy role
+    # has no legitimate reason to unsubscribe anything, so it may unsubscribe
+    # nothing.
+    actions   = ["sns:Unsubscribe"]
+    resources = ["*"]
+  }
+
+  # --- 4c. no editing its own permissions --------------------------------
   statement {
     sid    = "DenySelfModification"
     effect = "Deny"

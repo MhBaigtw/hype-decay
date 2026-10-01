@@ -161,8 +161,24 @@ class Manifest:
     def get(self, key):
         return self.table.get_item(Key={"source_hour": key}).get("Item")
 
-    def claim(self, key, canonical_url, hour_start):
+    def claim(self, key, canonical_url, hour_start, force=False):
+        """Claims the hour. With force=True a `done` row is claimable too.
+
+        Without the force branch, --force could never actually re-process an
+        hour: the caller skipped the no-op check and then failed this condition,
+        which only admits absent, pending, failed, or an expired in-flight.
+        """
         now = int(time.time())
+        claimable_states = [":pending", ":failed"] + ([":done"] if force else [])
+        values = {
+            ":inflight": "in-flight", ":pending": "pending", ":failed": "failed",
+            ":w": self.worker_id, ":lease": now + LEASE_SECONDS,
+            ":now": dt.datetime.now(dt.timezone.utc).isoformat(),
+            ":now_n": now, ":url": canonical_url,
+            ":hs": hour_start.isoformat(), ":one": 1,
+        }
+        if force:
+            values[":done"] = "done"
         try:
             self.table.update_item(
                 Key={"source_hour": key},
@@ -172,17 +188,11 @@ class Manifest:
                     "ADD attempt :one"
                 ),
                 ConditionExpression=(
-                    "attribute_not_exists(#s) OR #s IN (:pending, :failed) "
+                    f"attribute_not_exists(#s) OR #s IN ({', '.join(claimable_states)}) "
                     "OR (#s = :inflight AND lease_expires < :now_n)"
                 ),
                 ExpressionAttributeNames={"#s": "status"},
-                ExpressionAttributeValues={
-                    ":inflight": "in-flight", ":pending": "pending", ":failed": "failed",
-                    ":w": self.worker_id, ":lease": now + LEASE_SECONDS,
-                    ":now": dt.datetime.now(dt.timezone.utc).isoformat(),
-                    ":now_n": now, ":url": canonical_url,
-                    ":hs": hour_start.isoformat(), ":one": 1,
-                },
+                ExpressionAttributeValues=values,
             )
             return True
         except ClientError as e:
@@ -302,13 +312,20 @@ def parse(gz_path):
     stats["rows_other_project"] = table.num_rows - english.num_rows
 
     # Non-numeric view counts: counted, dropped, never guessed at.
-    numeric = pc.match_substring_regex(
-        pc.cast(english.column("views"), pa.string()), r"^[0-9]+$")
-    stats["rows_skipped_bad_int"] = english.num_rows - pc.sum(
-        pc.cast(numeric, pa.int64())).as_py()
+    #
+    # The digit test runs on the BINARY column directly. Casting to string first
+    # validates UTF-8 across the whole column and raises ArrowInvalid on a single
+    # stray byte, which would cost the entire hour for one bad row -- verified:
+    # match_substring_regex accepts binary and returns false for b"12\xff3",
+    # where cast(binary -> string) raises.
+    numeric = pc.match_substring_regex(english.column("views"), r"^[0-9]+$")
+    stats["rows_skipped_bad_int"] = english.num_rows - (pc.sum(
+        pc.cast(numeric, pa.int64())).as_py() or 0)
     english = english.filter(numeric)
 
     titles = english.column("title")
+    # Only digit-only values survived the filter above, so this cast is safe by
+    # construction rather than by hope.
     views = pc.cast(pc.cast(english.column("views"), pa.string()), pa.int64())
     stats["views_before_exclusions"] = pc.sum(views).as_py() or 0
 
@@ -438,10 +455,17 @@ def run(args):
         # would be lying about an hour that is actually done.
         log("dry run: the manifest will not be claimed or modified")
     else:
-        if not manifest.claim(key, canonical_url, hour_start):
+        if not manifest.claim(key, canonical_url, hour_start, force=args.force):
             held = manifest.get(key) or {}
-            log(f"another worker holds this hour: {held.get('worker_id')}, "
-                f"lease expires in {int(held.get('lease_expires', 0)) - int(time.time())}s")
+            status = held.get("status", "unknown")
+            if status == "done":
+                # Only reachable without --force, and the no-op branch above
+                # normally catches it first.
+                log(f"this hour is already done; pass --force to redo it")
+            else:
+                remaining = int(held.get("lease_expires", 0)) - int(time.time())
+                log(f"another worker holds this hour: {held.get('worker_id')} "
+                    f"(status {status}, lease {remaining:+d}s)")
             return 3
         log(f"claimed (attempt {int((manifest.get(key) or {}).get('attempt', 1))})")
 

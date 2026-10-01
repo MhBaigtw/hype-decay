@@ -50,6 +50,11 @@ HOSTILE_ROWS = [
     b"en Bad_Count notanumber 0\n",              # non-numeric view count
     b"en Bad_UTF8_\xff\xfe_Title 42 0\n",        # title is not valid UTF-8
     b"en.m Bad_UTF8_\xff\xfe_Title 8 0\n",       # ... and its mobile twin
+    # An invalid BYTE in the views field, not merely a non-numeric word. This is
+    # the case that used to cost the whole hour: the digit check cast the column
+    # to string first, and one such byte raised ArrowInvalid for every row in the
+    # file. It must now cost exactly this one row.
+    b"en Bad_Views_Byte 1\xff2 0\n",
 ]
 
 
@@ -121,7 +126,9 @@ def main():
                 out.write(row)
         _hviews, hstats = parse(hostile)
         passed.append(check("invalid rows skipped", hstats["rows_skipped_invalid"], 1))
-        passed.append(check("bad integers skipped", hstats["rows_skipped_bad_int"], 1))
+        # Two: the word "notanumber", and the byte-level 1\xff2 that used to take
+        # the whole file down with it.
+        passed.append(check("bad view counts skipped", hstats["rows_skipped_bad_int"], 2))
         passed.append(check("undecodable titles skipped",
                             hstats["rows_skipped_bad_utf8"], 1))
         passed.append(check("views behind undecodable titles",

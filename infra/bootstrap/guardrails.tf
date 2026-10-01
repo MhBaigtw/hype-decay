@@ -1,17 +1,16 @@
 # ---------------------------------------------------------------------------
-# Two independent cost tripwires.
+# The cost guardrails live here, not in the main module.
 #
-# 1. AWS Budgets watches actual month-to-date spend against a 10 USD budget.
-# 2. A CloudWatch alarm watches the AWS/Billing EstimatedCharges metric.
+# Reason: the main module is applied by the deploy role, and a guardrail the
+# deployer can delete is a guardrail on a timer. Moving budgets, the billing
+# alarm and the alert topic into the admin-only module -- and denying the deploy
+# role delete/modify on each of them, see iam.tf -- means an error in pipeline
+# code cannot remove the thing that would report the error.
 #
-# They are deliberately not the same mechanism. Budgets is a billing-side
-# service evaluated a few times a day; the CloudWatch alarm is metric-side and
-# fires within hours. If one is misconfigured, the other still fires.
-#
-# Both notify one SNS topic, and the email subscription to that topic is the
-# only channel that can be CONFIRMED immediately -- SNS sends a subscription
-# confirmation the moment it is created. That click is what proves the delivery
-# path works, rather than assuming it does.
+# Two independent tripwires, on purpose:
+#   1. AWS Budgets watches actual month-to-date spend, billing-side.
+#   2. A CloudWatch alarm watches AWS/Billing EstimatedCharges, metric-side.
+# If one is misconfigured the other still fires.
 # ---------------------------------------------------------------------------
 
 resource "aws_sns_topic" "alerts" {
@@ -24,8 +23,11 @@ resource "aws_sns_topic_subscription" "alerts_email" {
   protocol  = "email"
   endpoint  = var.contact_email
 
-  # Terraform cannot confirm an email subscription for you. After apply this
-  # stays "PendingConfirmation" until the link in the email is clicked.
+  # NOT imported: the original subscription was never confirmed and AWS has
+  # since discarded it, leaving the topic with zero subscribers and the billing
+  # alarm publishing into nothing. Applying this module creates it again, which
+  # sends a fresh confirmation email. Terraform cannot confirm it for you; until
+  # the link is clicked this stays PendingConfirmation and the alarm leg is dead.
 }
 
 data "aws_iam_policy_document" "alerts_topic" {
@@ -110,10 +112,14 @@ resource "aws_budgets_budget" "monthly" {
     for_each = var.budget_alert_percentages
 
     content {
-      comparison_operator        = "GREATER_THAN"
-      threshold                  = notification.value
-      threshold_type             = "PERCENTAGE"
-      notification_type          = "ACTUAL"
+      comparison_operator = "GREATER_THAN"
+      threshold           = notification.value
+      threshold_type      = "PERCENTAGE"
+      notification_type   = "ACTUAL"
+
+      # Both a direct email and the topic. The direct address does not depend on
+      # the SNS subscription being confirmed, which is why budget alerts still
+      # arrive while the alarm leg is dead.
       subscriber_email_addresses = [var.contact_email]
       subscriber_sns_topic_arns  = [aws_sns_topic.alerts.arn]
     }
@@ -133,8 +139,10 @@ resource "aws_budgets_budget" "tripwire_test" {
   limit_unit   = "USD"
   time_unit    = "MONTHLY"
 
-  # Any spend at all breaches this, so the notification fires on the next
-  # budget evaluation instead of waiting for 5 USD of real spend.
+  # Any spend at all breaches this, so the notification fires on the next budget
+  # evaluation instead of waiting for 5 USD of real spend. Still unproven as of
+  # 2026-09-30: month-to-date cost reads -0.0000 USD, so there has been nothing
+  # to breach. Inconclusive, not failed.
   notification {
     comparison_operator        = "GREATER_THAN"
     threshold                  = 100
@@ -151,7 +159,7 @@ resource "aws_budgets_budget" "tripwire_test" {
 
 resource "aws_cloudwatch_metric_alarm" "billing" {
   alarm_name        = "${var.project}-estimated-charges"
-  alarm_description = "Estimated charges for the account crossed ${var.billing_alarm_threshold_usd} USD. Independent of AWS Budgets on purpose."
+  alarm_description = "Estimated charges crossed ${var.billing_alarm_threshold_usd} USD. Independent of AWS Budgets on purpose."
 
   namespace   = "AWS/Billing"
   metric_name = "EstimatedCharges"
@@ -163,8 +171,7 @@ resource "aws_cloudwatch_metric_alarm" "billing" {
   threshold           = var.billing_alarm_threshold_usd
   comparison_operator = "GreaterThanOrEqualToThreshold"
 
-  # Missing data must not read as "fine". On a new account this metric can be
-  # absent for hours, and the alarm sits in INSUFFICIENT_DATA until it appears.
+  # Missing data must not read as "fine".
   treat_missing_data = "missing"
 
   alarm_actions = [aws_sns_topic.alerts.arn]

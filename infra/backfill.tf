@@ -28,10 +28,31 @@ data "aws_subnets" "default" {
   }
 }
 
-# Amazon Linux 2023 for arm64, resolved at plan time from the public SSM
-# parameter rather than pinned to an AMI id that goes stale.
-data "aws_ssm_parameter" "al2023_arm64" {
-  name = "/aws/service/ami-al2023-latest/al2023-ami-kernel-default-arm64"
+# Amazon Linux 2023 for arm64, resolved at plan time rather than pinned to an
+# AMI id that goes stale.
+#
+# This was an SSM public-parameter lookup first, and it failed: there is no
+# /aws/service/ami-al2023-latest namespace, and public parameter paths cannot be
+# enumerated to find the right one because GetParametersByPath rejects /aws/
+# outright. describe-images needs nothing beyond the ec2:Describe* the deploy
+# role already has, and the result can be read back and checked by hand.
+#
+# The filter pins the 6.1 kernel line deliberately. Amazon publishes 6.1 and
+# 6.12 arm64 AMIs with identical creation dates, so an unpinned most_recent
+# would flip kernel versions between plans for no stated reason.
+data "aws_ami" "al2023_arm64" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["al2023-ami-2*-kernel-6.1-arm64"]
+  }
+
+  filter {
+    name   = "state"
+    values = ["available"]
+  }
 }
 
 # --- network ---------------------------------------------------------------
@@ -188,7 +209,7 @@ locals {
 resource "aws_instance" "backfill" {
   count = local.backfill_count
 
-  ami           = data.aws_ssm_parameter.al2023_arm64.value
+  ami           = data.aws_ami.al2023_arm64.id
   instance_type = var.backfill_instance_type
   subnet_id     = data.aws_subnets.default.ids[0]
 

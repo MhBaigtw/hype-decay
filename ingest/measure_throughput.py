@@ -154,8 +154,9 @@ def parse_one(path):
     english = table.filter(pc.is_in(
         table.column("domain"),
         value_set=pa.array([b"en", b"en.m"], pa.binary())))
-    numeric = pc.match_substring_regex(
-        pc.cast(english.column("views"), pa.string()), r"^[0-9]+$")
+    # Digit test on binary, not on a string cast: the cast validates UTF-8 over
+    # the whole column and would fail the file over one stray byte.
+    numeric = pc.match_substring_regex(english.column("views"), r"^[0-9]+$")
     english = english.filter(numeric)
     views = pc.cast(pc.cast(english.column("views"), pa.string()), pa.int64())
     grouped = (pa.table({"title": english.column("title"), "views": views})
