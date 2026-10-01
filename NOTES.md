@@ -159,8 +159,7 @@ The day shrinks from 92.4 MB to 24.3 MB, so 730 days come to about 16.5 GiB, and
 the dbt workgroup cap is 25 GiB. Rejected: floor 0, at 62.8 GiB. Its price is
 that baselines must zero-fill (SPEC).
 
-**Breaks at 10x:** correcting an hour re-fetches its whole day, so a parser fix
-touching many days means re-downloading them.
+**Breaks at 10x:** correcting one hour re-fetches its whole day.
 
-**Code staged for the instance:** commit `0ac7fc83dbdb75402b66df064f37546e48c969c2`
-in the curated bucket under `code/`.
+**On the instance:** `code/` holds commit
+`0ac7fc83dbdb75402b66df064f37546e48c969c2`.
