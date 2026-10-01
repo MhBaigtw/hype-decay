@@ -163,4 +163,4 @@ that baselines must zero-fill (SPEC).
 touching many days means re-downloading them.
 
 **Code staged for the instance:** commit `0ac7fc83dbdb75402b66df064f37546e48c969c2`
-(`0ac7fc8`), in `s3://hype-decay-curated-820697996849/code/`.
+in the curated bucket under `code/`.
