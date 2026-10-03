@@ -62,9 +62,11 @@ wrong answer. The manifest day row is the authority either way.
 import argparse
 import datetime as dt
 import io
+import json
 import os
 import sys
 import time
+from collections import Counter
 
 import boto3
 import pyarrow as pa
@@ -76,6 +78,9 @@ DEFAULT_TABLE = "hype-decay-manifest"
 DEFAULT_REGION = "us-east-1"
 
 HOURS_PER_DAY = 24
+
+# S3 requests sent by this process, by operation, reported in the RESULT line.
+S3_REQUESTS = Counter()
 
 # SPEC: the daily-views floor is applied at compaction and nowhere else.
 DEFAULT_FLOOR = 10
@@ -214,8 +219,8 @@ def finish_placement(s3, manifest, bucket, row, day):
         log("deleted and the compacted copy is gone: this day must be re-ingested.")
         manifest.update_item(
             Key={"source_hour": f"day#{day}"},
-            UpdateExpression="SET #s = :failed, error = :why",
-            ExpressionAttributeNames={"#s": "status"},
+            UpdateExpression="SET #s = :failed, #e = :why",   # error is reserved
+            ExpressionAttributeNames={"#s": "status", "#e": "error"},
             ExpressionAttributeValues={
                 ":failed": "failed",
                 ":why": "compacting interrupted and both staging and final are absent"},
@@ -369,7 +374,7 @@ def refloor(s3, manifest, args, day, row):
     return 0
 
 
-def main():
+def _main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     ap.add_argument("--dt", required=True, help="the DAY to compact, YYYY-MM-DD")
     ap.add_argument("--floor", type=int, default=DEFAULT_FLOOR,
@@ -395,6 +400,9 @@ def main():
     day = dt.date.fromisoformat(args.dt)
     session = boto3.Session(profile_name=args.profile, region_name=args.region)
     s3 = session.client("s3")
+    s3.meta.events.register(
+        "before-send.s3",
+        lambda event_name=None, **_: S3_REQUESTS.update([event_name.rsplit(".", 1)[-1]]))
     manifest = session.resource("dynamodb").Table(args.table)
     day_key = f"day#{day}"
 
@@ -542,6 +550,19 @@ def main():
         s3.delete_object(Bucket=args.bucket, Key=quarantined)
         log(f"removed the quarantined copy s3://{args.bucket}/{quarantined}")
     return 0
+
+
+def main():
+    """Runs a compaction and ends with one machine-readable RESULT line, which
+    backfill.py reads: it runs this as a subprocess so the ~5.4 GiB a day's
+    compaction peaks at goes back to the OS the moment it exits."""
+    started = time.time()
+    code = _main()
+    print("RESULT " + json.dumps({
+        "exit": code, "secs": round(time.time() - started, 1),
+        "peak_rss_mib": round(peak_rss_mib(), 1),
+        "s3_requests": dict(S3_REQUESTS)}), flush=True)
+    return code
 
 
 if __name__ == "__main__":

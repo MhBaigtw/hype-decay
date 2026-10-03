@@ -41,15 +41,23 @@ same courtesy applies.
 
     python3 ingest_hour.py --source-hour 2026-09-10T18
     python3 ingest_hour.py --source-hour 2026-09-10T18 --source origin --dry-run
+    python3 ingest_hour.py --source-hour 2024-09-13T01 --no-fixture    # backfill
+
+--no-fixture is for the backfill. The fixture exists to keep 48 hours of source
+as a format-regression test; without the flag a backfill would copy all 939 GiB
+of source into fixtures/raw_48h/ and pay to store it until the lifecycle rule
+caught up.
 """
 
 import argparse
+import contextlib
 import datetime as dt
 import hashlib
 import os
 import socket
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -62,6 +70,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.csv as pacsv
 import pyarrow.parquet as pq
+from boto3.s3.transfer import TransferConfig
 from botocore.exceptions import ClientError
 
 # --- policy -----------------------------------------------------------------
@@ -106,6 +115,60 @@ PAGE_HOUR_MIN_VIEWS = 10
 # extends it while downloading, so an expired lease means the worker died.
 LEASE_SECONDS = 60
 HEARTBEAT_SECONDS = 15
+
+# One PUT per object. boto3 otherwise goes multipart above 8 MiB, which turns
+# each ~23 MiB page_daily partial into five requests (create, three parts,
+# complete) -- about 70,000 extra requests over the backfill for nothing, since
+# a single PUT takes up to 5 GiB.
+UPLOAD_CONFIG = TransferConfig(multipart_threshold=256 * 1024 * 1024)
+
+# S3 requests this process has sent, by operation. Counted at the botocore
+# layer, so retries count too: this is what is billed, not what was intended.
+S3_REQUESTS = Counter()
+
+
+def _count_s3_request(event_name=None, **_):
+    S3_REQUESTS[event_name.rsplit(".", 1)[-1]] += 1
+
+
+class LeaseKeeper:
+    """Extends an hour's lease for as long as the hour is being worked on.
+
+    The lease used to be extended only while downloading. In the backfill an
+    hour can wait for a free connection, then parse and upload after its
+    download, and a lease that lapsed mid-hour would let a restarted runner take
+    an hour that is still being written. This covers claim to finish. It uses
+    its own low-level client because boto3 resources are not thread-safe, and
+    the condition means a beat that lands after the hour finished changes
+    nothing.
+    """
+
+    def __init__(self, client, table, key):
+        self.client, self.table, self.key = client, table, key
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._beat, daemon=True)
+
+    def _beat(self):
+        while not self.stop.wait(HEARTBEAT_SECONDS):
+            try:
+                self.client.update_item(
+                    TableName=self.table, Key={"source_hour": {"S": self.key}},
+                    UpdateExpression="SET lease_expires = :lease",
+                    ConditionExpression="#s = :inflight",
+                    ExpressionAttributeNames={"#s": "status"},
+                    ExpressionAttributeValues={
+                        ":lease": {"N": str(int(time.time()) + LEASE_SECONDS)},
+                        ":inflight": {"S": "in-flight"}})
+            except ClientError:
+                pass  # finished, failed, or transient: the next beat retries
+
+    def start(self):
+        self.thread.start()
+
+    def close(self):
+        self.stop.set()
+        if self.thread.is_alive():
+            self.thread.join(timeout=5)
 
 # Regression fixture. These numbers were verified against the Wikimedia REST API
 # in Task 0 -- 4,024,554 desktop + 5,742,163 mobile-web + 224,463 mobile-app --
@@ -154,9 +217,10 @@ def build_url(base, source_hour):
 class Manifest:
     """One row per source hour: what was fetched, from where, and what it held."""
 
-    def __init__(self, table, worker_id):
+    def __init__(self, table, worker_id, clock=time.time):
         self.table = table
         self.worker_id = worker_id
+        self.clock = clock  # injectable so tests can age leases
 
     def get(self, key):
         return self.table.get_item(Key={"source_hour": key}).get("Item")
@@ -168,7 +232,7 @@ class Manifest:
         hour: the caller skipped the no-op check and then failed this condition,
         which only admits absent, pending, failed, or an expired in-flight.
         """
-        now = int(time.time())
+        now = int(self.clock())
         claimable_states = [":pending", ":failed"] + ([":done"] if force else [])
         values = {
             ":inflight": "in-flight", ":pending": "pending", ":failed": "failed",
@@ -223,8 +287,12 @@ class Manifest:
     def fail(self, key, reason):
         self.table.update_item(
             Key={"source_hour": key},
-            UpdateExpression="SET #s = :failed, error = :reason",
-            ExpressionAttributeNames={"#s": "status"},
+            # "error" is a DynamoDB reserved word, so it must go through a
+            # name placeholder. Written bare, every failure raised a
+            # ValidationException and the hour stayed in-flight instead of
+            # reading failed -- verified against the real table 2026-10-03.
+            UpdateExpression="SET #s = :failed, #e = :reason",
+            ExpressionAttributeNames={"#s": "status", "#e": "error"},
             ExpressionAttributeValues={":failed": "failed", ":reason": str(reason)[:900]},
         )
 
@@ -526,7 +594,10 @@ def build_tiers(views_by_title, hour_start):
 
 # --- main ------------------------------------------------------------------
 
-def run(args):
+def run(args, download_gate=None):
+    """Ingests one hour. download_gate, if given, is held around every request
+    to the mirror or the origin, so several workers share one connection cap
+    (backfill.py passes a semaphore of 3 shared across its processes)."""
     source_hour = parse_source_hour(args.source_hour)
     hour_start = hour_start_of(source_hour)
     key = f"{source_hour:%Y-%m-%dT%H}"
@@ -546,6 +617,8 @@ def run(args):
     session = boto3.Session(profile_name=args.profile, region_name=args.region)
     manifest = Manifest(session.resource("dynamodb").Table(args.table), worker_id)
     s3 = session.client("s3")
+    s3.meta.events.register("before-send.s3", _count_s3_request)
+    no_fixture = getattr(args, "no_fixture", False)
 
     existing = manifest.get(key)
     if existing and existing.get("status") == "done" and not args.force:
@@ -596,29 +669,37 @@ def run(args):
 
     workdir = Path(tempfile.mkdtemp(prefix="hype-decay-"))
     gz_path = workdir / f"pageviews-{source_hour:%Y%m%d}-{source_hour:%H}0000.gz"
+    keeper = None
+    if not args.dry_run:
+        keeper = LeaseKeeper(session.client("dynamodb"), args.table, key)
+        keeper.start()
 
     try:
         print()
         log("downloading...")
         started = time.time()
-        size, sha256, declared = download(
-            fetch_url, gz_path,
-            None if args.dry_run else manifest,
-            None if args.dry_run else key)
-        elapsed = time.time() - started
-        log(f"{human(size)} in {elapsed:.1f}s ({human(size / max(elapsed, 0.01))}/s)")
-        log(f"sha256 {sha256}")
-        if declared and declared != size:
-            raise RuntimeError(f"content-length {declared} != bytes received {size}")
+        # The gate covers the mirror GET and the origin HEAD alike: both are
+        # connections to someone else's server, and the cap is on connections.
+        with download_gate or contextlib.nullcontext():
+            gate_wait = time.time() - started
+            size, sha256, declared = download(fetch_url, gz_path)
+            elapsed = time.time() - started - gate_wait
+            log(f"{human(size)} in {elapsed:.1f}s "
+                f"({human(size / max(elapsed, 0.01))}/s)"
+                + (f", after {gate_wait:.1f}s waiting for a connection"
+                   if download_gate else ""))
+            log(f"sha256 {sha256}")
+            if declared and declared != size:
+                raise RuntimeError(f"content-length {declared} != bytes received {size}")
 
-        origin_length = 0
-        if args.source != "origin" and args.verify_origin_length:
-            origin_length = origin_content_length(source_hour)
-            if origin_length and origin_length != size:
-                raise RuntimeError(
-                    f"mirror served {size} bytes but the origin declares "
-                    f"{origin_length}: refusing to trust this copy")
-            log(f"origin content-length agrees: {origin_length:,} bytes")
+            origin_length = 0
+            if args.source != "origin" and args.verify_origin_length:
+                origin_length = origin_content_length(source_hour)
+                if origin_length and origin_length != size:
+                    raise RuntimeError(
+                        f"mirror served {size} bytes but the origin declares "
+                        f"{origin_length}: refusing to trust this copy")
+                log(f"origin content-length agrees: {origin_length:,} bytes")
 
         print()
         log("parsing (pyarrow)...")
@@ -672,10 +753,16 @@ def run(args):
         fixture_key = (f"fixtures/raw_48h/dt={hour_start:%Y-%m-%d}/"
                        f"hour={hour_start:%H}/{gz_path.name}")
 
+        uploads = [(hour_path, hour_key), (daily_path, daily_key)]
+        if no_fixture:
+            log("--no-fixture: the source gz is NOT kept (backfill)")
+        else:
+            uploads.append((gz_path, fixture_key))
+
         if args.dry_run:
             print()
             log("dry run: nothing uploaded, manifest untouched")
-            for k in (hour_key, daily_key, fixture_key):
+            for _, k in uploads:
                 log(f"  would write s3://{args.bucket}/{k}")
             return 0
 
@@ -685,9 +772,8 @@ def run(args):
             log(f"day#{day} INVALIDATED; day.parquet moved to "
                 f"s3://{args.bucket}/{quarantine_key(day)}")
         log("uploading...")
-        for local, s3_key in ((hour_path, hour_key), (daily_path, daily_key),
-                              (gz_path, fixture_key)):
-            s3.upload_file(str(local), args.bucket, s3_key)
+        for local, s3_key in uploads:
+            s3.upload_file(str(local), args.bucket, s3_key, Config=UPLOAD_CONFIG)
             log(f"s3://{args.bucket}/{s3_key}")
 
         manifest.finish(key, {
@@ -711,7 +797,8 @@ def run(args):
             "distinct_titles": len(views_by_title),
             "key_page_hour": hour_key,
             "key_page_daily": daily_key,
-            "key_fixture": fixture_key,
+            "fixture_uploaded": not no_fixture,
+            **({} if no_fixture else {"key_fixture": fixture_key}),
         })
         print()
         log("manifest row marked done")
@@ -727,6 +814,8 @@ def run(args):
         raise
 
     finally:
+        if keeper:
+            keeper.close()
         for leftover in workdir.glob("*"):
             leftover.unlink(missing_ok=True)
         workdir.rmdir()
@@ -749,6 +838,8 @@ def main():
                          "compacted day this INVALIDATES the day")
     ap.add_argument("--dry-run", action="store_true",
                     help="download and parse, but write nothing and touch no state")
+    ap.add_argument("--no-fixture", action="store_true",
+                    help="do not keep the source gz in fixtures/raw_48h/ (backfill)")
     args = ap.parse_args()
     return run(args)
 
