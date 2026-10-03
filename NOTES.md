@@ -163,3 +163,29 @@ that baselines must zero-fill (SPEC).
 
 **On the instance:** `code/` holds commit
 `0ac7fc83dbdb75402b66df064f37546e48c969c2`.
+
+---
+
+## Task 3 — measurement run on the instance (2026-10-03)
+
+**Ran:** `i-04d58a137d31e0361`, c7g.xlarge, AL2023 kernel 6.18, commit
+`0ac7fc8`. Time box 180 minutes; the timer was verified armed over SSM. Launched
+20:02:17Z, terminated 20:05:59Z once the run ended; root volume confirmed gone.
+Cost about $0.01.
+
+**Which service does what:** EC2 ran the measurement, SSM Run Command drove it
+without an inbound port, and S3 supplied the pinned code.
+
+**Measured, one whole day (24 files, 1,354 MiB):** download 333.9 MiB/s at 3
+connections, parse 3.84 s per file. Full window: download 0.8 h, parse 4.7 h,
+so processing binds, not the connection cap. Estimated $0.68.
+
+**Memory:** parse worker peak 1,582 MiB, compaction peak 5,435 MiB. Four workers
+plus one compaction need 11.49 GiB against 7.6 GiB usable. They do not fit, so
+compaction cannot overlap parsing on this box as designed.
+
+**Decision:** terminated by hand, not by the timer. Rejected: letting the timer
+do it, which bills three hours for four minutes of work.
+
+**Breaks at 10x:** compaction memory grows with distinct titles per day, and it
+already takes 70% of the box.
