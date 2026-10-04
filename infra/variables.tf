@@ -123,9 +123,17 @@ variable "backfill_time_box_minutes" {
     and the instance terminates rather than stops, so a forgotten box bills for
     this long and no longer. CLAUDE.md requires the box to be stated before
     launch.
+
+    1080 minutes (18 h) for the full backfill, sized from the 3-day trial on
+    2026-10-04: 66.6 s a day measured, of which about 9 s was the trial-only
+    verification copy, so about 58 s a day in production. 730 days x 58 s is
+    11.8 h; 1.5x margin is 17.6 h, plus boot, so 18 h. At $0.145/h that caps a
+    forgotten box at $2.61. If the timer does fire early the runner resumes
+    from the manifest on the next launch, so an undersized box costs a relaunch,
+    not data. A trial passes a smaller box with -var.
   EOT
   type        = number
-  default     = 180
+  default     = 1080
 }
 
 variable "athena_results_retention_days" {

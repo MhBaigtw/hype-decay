@@ -189,3 +189,28 @@ do it, which bills three hours for four minutes of work.
 
 **Breaks at 10x:** compaction memory grows with distinct titles per day, and it
 already takes 70% of the box.
+
+---
+
+## Task 3 — 3-day backfill trial (2026-10-04)
+
+**Ran:** `backfill.py` for 2024-09-13 to 2024-09-15 on `i-05229fb4658780aa7`,
+commit `7390248`, 45-minute time box. Launched 02:03:58Z, terminated by
+`terraform apply` at 02:12:51Z; root volume confirmed gone.
+
+**Which service does what:** EC2 ran the runner, DynamoDB held every decision
+it made, CloudWatch took per-day progress, and S3 took the Parquet.
+
+**Measured:** 66.6 s a day (42 s ingest, 24 s compaction, about 9 s of that a
+trial-only copy). Peaks: parse 1,608 MiB, compaction 5,714 MiB. MemAvailable
+never fell below 1,456 MiB. 77 S3 requests a day. All three days matched an
+independent recompaction and the manifest's per-hour totals.
+
+**Decision:** parsing and compaction alternate. Rejected: overlapping them,
+which needs 11.5 GiB on a 7.6 GiB box. Full-run time box: 18 h, from 58 s a
+day × 730 × 1.5.
+
+**Found:** `Manifest.fail` wrote the reserved word `error`, so no hour could
+ever be marked failed. moto caught it, and real DynamoDB confirmed it.
+
+**Breaks at 10x:** compaction memory. It left 1.4 GiB free.
