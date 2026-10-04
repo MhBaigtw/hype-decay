@@ -109,7 +109,7 @@ variable "backfill_code_commit" {
     between launches.
   EOT
   type        = string
-  default     = "7390248276c67fc486d86915e0454fa5466a6508" # uploaded 2026-10-03
+  default     = "a3d3b031af5ef377e51594c6af9861f6d262981a" # uploaded 2026-10-04
 
   validation {
     condition     = var.backfill_code_commit == "" || can(regex("^[0-9a-f]{40}$", var.backfill_code_commit))
