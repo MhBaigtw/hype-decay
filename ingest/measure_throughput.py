@@ -12,7 +12,7 @@ Answers what Task 3 design needs:
 
 MEASURES THE REAL CODE. Parse workers call ingest_hour.parse() and build_tiers()
 and write a real page_daily partial; the compaction stage calls
-compact_day.aggregate_arrow() on those partials and applies the floor. An
+compact_day.aggregate_incremental() on those partials and applies the floor. An
 earlier version carried its own copy of the parse and stopped before
 build_tiers, which builds Python lists of every title and is a real share of a
 worker's memory.
@@ -190,7 +190,7 @@ def compact_one(partials, day, floor):
 
     started = time.time()
     bodies = [Path(p).read_bytes() for p in partials]
-    compacted = compact_day.aggregate_arrow(bodies, dt.date.fromisoformat(day))
+    compacted = compact_day.aggregate_incremental(iter(bodies), dt.date.fromisoformat(day))
     rows_unfloored = compacted.num_rows
     compacted = compacted.filter(pc.greater_equal(compacted.column("views"), floor))
     buf = io.BytesIO()

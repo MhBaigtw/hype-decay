@@ -89,6 +89,25 @@ RETRY_BACKOFF_SECONDS = (30, 120)
 PARSE_WORKERS = 4         # c7g.xlarge: 4 vCPUs, 4 x 1.6 GiB fits in 7.6 GiB
 METRIC_NAMESPACE = "hype-decay/backfill"
 
+# Who the kernel kills first when memory runs out (-1000 never .. 1000 first).
+# Run 1 died with no record of which process went, so the order is now set
+# rather than left to the kernel's size heuristic: a compaction subprocess
+# first -- it is the biggest consumer, and losing it costs one retry in the
+# second pass -- then a parse worker, and the runner almost never. The wrapper
+# sits at -950 (run_backfill.sh), below the runner.
+OOM_SCORE_RUNNER = -900
+OOM_SCORE_PARSE_WORKER = 0
+OOM_SCORE_COMPACTION = 1000
+
+
+def set_oom_score(value):
+    """Linux only; a no-op elsewhere. Lowering below 0 needs root, which the
+    systemd unit has."""
+    try:
+        Path("/proc/self/oom_score_adj").write_text(str(value))
+    except OSError:
+        pass
+
 
 def log(msg):
     print(f"{dt.datetime.now(dt.timezone.utc):%H:%M:%S}  {msg}", flush=True)
@@ -249,6 +268,9 @@ _WORKER_OPTS = None
 def _init_worker(gate, opts):
     global _GATE, _WORKER_OPTS
     _GATE, _WORKER_OPTS = gate, opts
+    # Workers are forked (via the forkserver) from the runner and would
+    # otherwise inherit its -900, making them harder to kill than compaction.
+    set_oom_score(OOM_SCORE_PARSE_WORKER)
 
 
 def _ingest_one(hour):
@@ -305,7 +327,11 @@ def make_compact(opts, verify_copy):
         if opts["profile"]:
             cmd += ["--profile", opts["profile"]]
         with open(log_path, "w", encoding="utf-8") as out:
-            proc = subprocess.run(cmd, stdout=out, stderr=subprocess.STDOUT)
+            # Not preexec_fn: it is unsafe in a process with threads, and the
+            # runner has one. compact_day reads this and sets its own score.
+            proc = subprocess.run(cmd, stdout=out, stderr=subprocess.STDOUT,
+                                  env={**os.environ,
+                                       "HYPE_DECAY_OOM_SCORE": str(OOM_SCORE_COMPACTION)})
         text = log_path.read_text(encoding="utf-8")
         found = re.findall(r"^RESULT (\{.*\})$", text, flags=re.M)
         result = json.loads(found[-1]) if found else {}
@@ -423,6 +449,7 @@ def main():
         log(f"--start/--end must lie inside {WINDOW_START} .. {WINDOW_END}")
         return 2
 
+    set_oom_score(OOM_SCORE_RUNNER)
     Path(args.log_dir).mkdir(parents=True, exist_ok=True)
     Path(args.tmpdir).mkdir(parents=True, exist_ok=True)
     os.environ["TMPDIR"] = args.tmpdir      # inherited by every worker

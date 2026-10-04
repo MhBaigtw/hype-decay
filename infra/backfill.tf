@@ -162,6 +162,15 @@ data "aws_iam_policy_document" "backfill" {
     }
   }
 
+  # run_backfill.sh arms the stall alarm when it starts and disarms it after a
+  # clean finish. This alarm only: the billing alarm is out of reach.
+  statement {
+    sid       = "ArmOwnStallAlarm"
+    effect    = "Allow"
+    actions   = ["cloudwatch:EnableAlarmActions", "cloudwatch:DisableAlarmActions"]
+    resources = ["arn:aws:cloudwatch:${var.region}:${data.aws_caller_identity.current.account_id}:alarm:${var.project}-backfill-stall"]
+  }
+
   # Deny everything expensive outright, exactly as the deploy role does. An
   # instance with credentials is a place where a mistake becomes a bill.
   statement {
@@ -277,6 +286,48 @@ resource "aws_instance" "backfill" {
     Task       = "task-3-backfill"
     TimeBoxMin = tostring(var.backfill_time_box_minutes)
     CodeCommit = var.backfill_code_commit
+  }
+}
+
+# --- stall alarm -------------------------------------------------------------
+#
+# Run 1 of the backfill died mid-window and nothing said so for ten hours. This
+# alarm fires if no day is compacted for 20 minutes: four 5-minute periods in a
+# row where DaysCompacted sums below 1. Missing data counts as breaching, since
+# a dead box publishes nothing at all, which is the case that matters most.
+#
+# It exists only alongside the instance (same count), and its ACTIONS are armed
+# by run_backfill.sh when the runner starts and disarmed after a clean finish.
+# So it is silent between runs, but a box that dies mid-run leaves it armed and
+# it reports. ignore_changes stops Terraform fighting the wrapper over that
+# flag. It publishes to the bootstrap-owned alerts topic, referenced by name
+# because the two modules keep separate state.
+#
+# Cost: one standard alarm, $0.10/month prorated, for as long as it exists.
+
+resource "aws_cloudwatch_metric_alarm" "backfill_stall" {
+  count = local.backfill_count
+
+  alarm_name        = "${var.project}-backfill-stall"
+  alarm_description = "No backfill day compacted for 20 minutes. Check the manifest and s3://${aws_s3_bucket.curated.bucket}/logs/backfill/."
+
+  namespace   = "${var.project}/backfill"
+  metric_name = "DaysCompacted"
+  statistic   = "Sum"
+  period      = 300
+
+  evaluation_periods  = 4
+  datapoints_to_alarm = 4
+  threshold           = 1
+  comparison_operator = "LessThanThreshold"
+  treat_missing_data  = "breaching"
+
+  alarm_actions = ["arn:aws:sns:${var.region}:${data.aws_caller_identity.current.account_id}:${var.project}-alerts"]
+
+  tags = { Task = "task-3-backfill" }
+
+  lifecycle {
+    ignore_changes = [actions_enabled]
   }
 }
 

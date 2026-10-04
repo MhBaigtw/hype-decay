@@ -54,7 +54,7 @@ DOUBLE-COUNTED. An empty partition is a visible gap; a double count is a silent
 wrong answer. The manifest day row is the authority either way.
 
     python3 compact_day.py --dt 2026-09-10 --dry-run
-    python3 compact_day.py --dt 2026-09-10 --engine both
+    python3 compact_day.py --dt 2026-09-10 --engine arrow       # old all-at-once engine
     python3 compact_day.py --dt 2026-09-10 --crash-after-delete   # test recovery
     python3 compact_day.py --dt 2026-09-10 --force --floor 10      # refloor
 """
@@ -190,7 +190,57 @@ def aggregate_arrow(bodies, day):
     ], schema=PAGE_DAILY_SCHEMA)
 
 
-ENGINES = {"arrow": aggregate_arrow, "python": aggregate_python}
+def aggregate_incremental(bodies, day):
+    """Folds one partial at a time into a running aggregate. The default.
+
+    aggregate_arrow concatenates all 24 partials -- about 42 million rows --
+    and groups them in one go, and on the backfill box that peaked between 5.6
+    and 7.1 GiB depending on the day, against 7.6 GiB usable. Run 1 of the
+    backfill died in exactly that step. Here the most ever held is the running
+    total (one row per page seen so far, about 7 million by the end of a day)
+    plus a single hour, so the peak tracks distinct pages, not 24x them.
+
+    `bodies` may be any iterable, so the caller can fetch each partial only
+    when it is needed. The result is identical to aggregate_arrow: same
+    schema, same rows, same order -- test_compaction_engines.py checks that,
+    and compare_engines.py checked it on a real day.
+    """
+    running = None
+    for body in bodies:
+        hour = pq.read_table(io.BytesIO(body), columns=["page_title", "views",
+                                                        "hours_present"])
+        hour = pa.table({
+            "page_title": hour.column("page_title"),
+            "views": hour.column("views").cast(pa.int64()),
+            "hours_present": hour.column("hours_present").cast(pa.int64()),
+        })
+        both = hour if running is None else pa.concat_tables([running, hour])
+        grouped = both.group_by("page_title").aggregate([
+            ("views", "sum"), ("hours_present", "sum")])
+        running = pa.table({
+            "page_title": grouped.column("page_title"),
+            "views": grouped.column("views_sum"),
+            "hours_present": grouped.column("hours_present_sum"),
+        }).combine_chunks()
+        del hour, both, grouped
+    if running is None:
+        running = pa.table({"page_title": pa.array([], pa.string()),
+                            "views": pa.array([], pa.int64()),
+                            "hours_present": pa.array([], pa.int64())})
+
+    running = running.sort_by("page_title")
+    rows = running.num_rows
+    return pa.Table.from_arrays([
+        pa.array(["en.wikipedia"] * rows, pa.string()),
+        running.column("page_title").combine_chunks().cast(pa.string()),
+        pa.array([day] * rows, pa.date32()),
+        running.column("views").combine_chunks().cast(pa.int64()),
+        running.column("hours_present").combine_chunks().cast(pa.int32()),
+    ], schema=PAGE_DAILY_SCHEMA)
+
+
+ENGINES = {"incremental": aggregate_incremental, "arrow": aggregate_arrow,
+           "python": aggregate_python}
 
 
 # --- recovery --------------------------------------------------------------
@@ -268,7 +318,7 @@ def place(s3, manifest, args, day, compacted, row_fields, partials=()):
         "rows": compacted.num_rows,
         "views": pc.sum(compacted.column("views")).as_py() or 0,
         "bytes_compacted": buf.tell(),
-        "engine": "arrow",
+        "engine": args.engine,
         "key_staging": staging_key,
         "key_compacted": final_key,
         "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -380,8 +430,10 @@ def _main():
     ap.add_argument("--floor", type=int, default=DEFAULT_FLOOR,
                     help=f"drop pages whose whole-day views are below this "
                          f"(default {DEFAULT_FLOOR}; 0 = keep all)")
-    ap.add_argument("--engine", choices=["arrow", "python", "both"], default="arrow",
-                    help="both times each engine and cross-checks them")
+    ap.add_argument("--engine", choices=sorted(ENGINES), default="incremental",
+                    help="incremental (default) holds one hour at a time; arrow and "
+                         "python load all 24 and are kept for comparison only "
+                         "(see compare_engines.py)")
     ap.add_argument("--bucket", default=DEFAULT_BUCKET)
     ap.add_argument("--table", default=DEFAULT_TABLE)
     ap.add_argument("--region", default=DEFAULT_REGION)
@@ -478,37 +530,17 @@ def _main():
     partial_bytes = sum(o["Size"] for o in partials)
     log(f"{len(partials)} partials, {human(partial_bytes)} total")
 
+    # Fetched lazily: the incremental engine pulls each partial only when it
+    # folds it in, so the 24 bodies are never in memory together.
+    def fetch():
+        for o in partials:
+            yield s3.get_object(Bucket=args.bucket, Key=o["Key"])["Body"].read()
+
     started = time.time()
-    bodies = [s3.get_object(Bucket=args.bucket, Key=o["Key"])["Body"].read()
-              for o in partials]
-    log(f"downloaded partials in {time.time() - started:.1f}s")
-
-    # --- aggregate, timing each engine asked for --------------------------
-    timings, results = {}, {}
-    for name in (["arrow", "python"] if args.engine == "both" else [args.engine]):
-        started = time.time()
-        results[name] = ENGINES[name](bodies, day)
-        timings[name] = time.time() - started
-        log(f"{name:<6} aggregate: {timings[name]:6.2f}s, "
-            f"{results[name].num_rows:,} rows")
-
-    if args.engine == "both":
-        arrow_t, python_t = results["arrow"], results["python"]
-        same_rows = arrow_t.num_rows == python_t.num_rows
-        same_views = (pc.sum(arrow_t.column("views")).as_py()
-                      == pc.sum(python_t.column("views")).as_py())
-        same_hours = (pc.sum(arrow_t.column("hours_present")).as_py()
-                      == pc.sum(python_t.column("hours_present")).as_py())
-        log(f"cross-check: rows {'match' if same_rows else 'DIFFER'}, "
-            f"views {'match' if same_views else 'DIFFER'}, "
-            f"hours_present {'match' if same_hours else 'DIFFER'}")
-        if not (same_rows and same_views and same_hours):
-            log("the two engines disagree; refusing to write either result")
-            return 1
-        log(f"speedup: python {timings['python']:.2f}s -> arrow "
-            f"{timings['arrow']:.2f}s = {timings['python'] / timings['arrow']:.1f}x")
-
-    compacted = results.get("arrow") or results[args.engine]
+    bodies = fetch() if args.engine == "incremental" else list(fetch())
+    compacted = ENGINES[args.engine](bodies, day)
+    log(f"{args.engine} aggregate (download included): {time.time() - started:6.2f}s, "
+        f"{compacted.num_rows:,} rows, peak RSS so far {peak_rss_mib():,.0f} MiB")
     unfloored_rows = compacted.num_rows
     unfloored_views = pc.sum(compacted.column("views")).as_py() or 0
 
@@ -556,6 +588,14 @@ def main():
     """Runs a compaction and ends with one machine-readable RESULT line, which
     backfill.py reads: it runs this as a subprocess so the ~5.4 GiB a day's
     compaction peaks at goes back to the OS the moment it exits."""
+    # backfill.py sets this so that, under memory pressure, the kernel kills a
+    # compaction before the runner or the wrapper (see OOM_SCORE_* there).
+    if os.environ.get("HYPE_DECAY_OOM_SCORE"):
+        try:
+            with open("/proc/self/oom_score_adj", "w") as f:
+                f.write(os.environ["HYPE_DECAY_OOM_SCORE"])
+        except OSError:
+            pass
     started = time.time()
     code = _main()
     print("RESULT " + json.dumps({

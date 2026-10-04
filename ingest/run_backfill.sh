@@ -4,8 +4,19 @@
 # Started on the instance as a transient systemd service, so it belongs to PID 1
 # and not to an SSM command or anyone's session:
 #
-#   systemd-run --unit=hype-decay-backfill --collect \
+#   systemd-run --unit=hype-decay-backfill --collect -p OOMScoreAdjust=-950 \
 #     /bin/bash /opt/hype-decay/ingest/run_backfill.sh [backfill.py args]
+#
+# RESTARTS. A run has FINISHED when backfill.py reaches its end and writes
+# summary.json -- whatever its exit code, since 1 there only means some days
+# were left uncompacted, which a restart cannot fix. Anything else (killed,
+# crashed, out of memory) is abnormal, and the runner is restarted, up to 3
+# times. The manifest makes a restart lose and repeat nothing.
+#
+# STALL ALARM. hype-decay-backfill-stall fires if no day is compacted for 20
+# minutes. Its actions are enabled here at start and disabled only after a
+# clean finish, so it is silent between runs but does fire if this box dies
+# mid-run -- exactly the case run 1 went unnoticed in.
 #
 # Whatever the runner's exit code, the box shuts down when it ends, and it is set
 # to TERMINATE on shutdown, so finishing early stops the bill early. The
@@ -19,11 +30,16 @@
 
 BUCKET="${HYPE_DECAY_BUCKET:-hype-decay-curated-820697996849}"
 REGION=us-east-1
-LOG=/var/log/hype-decay
+ALARM=hype-decay-backfill-stall
+MAX_RESTARTS=3
+LOG="${HYPE_DECAY_LOG:-/var/log/hype-decay}"
+HOME_DIR="${HYPE_DECAY_HOME:-/opt/hype-decay}"
+RESTART_DELAY="${HYPE_DECAY_RESTART_DELAY:-30}"
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
 DEST="s3://$BUCKET/logs/backfill/$RUN_ID"
 
 mkdir -p "$LOG"
+echo -950 > /proc/$$/oom_score_adj 2>/dev/null   # below the runner's -900
 trap 'echo "shutting down $(date -u +%FT%TZ)" >> "$LOG/backfill.log"; shutdown -h now' EXIT
 
 ship() {
@@ -35,11 +51,39 @@ ship() {
 ( while sleep 600; do ship; done ) &
 shipper=$!
 
-cd /opt/hype-decay/ingest
-echo "run $RUN_ID, commit $(cat /opt/hype-decay/COMMIT), args: $*" > "$LOG/backfill.log"
-python3.12 backfill.py --log-dir "$LOG" "$@" >> "$LOG/backfill.log" 2>&1
-code=$?
-echo "runner exit $code at $(date -u +%FT%TZ)" >> "$LOG/backfill.log"
+cd "$HOME_DIR/ingest"
+echo "run $RUN_ID, commit $(cat "$HOME_DIR/COMMIT"), args: $*" > "$LOG/backfill.log"
+aws cloudwatch enable-alarm-actions --alarm-names "$ALARM" --region $REGION \
+    && echo "stall alarm armed" >> "$LOG/backfill.log"
+
+attempt=0
+finished=no
+while :; do
+    attempt=$((attempt + 1))
+    rm -f "$LOG/summary.json"
+    echo "attempt $attempt starting $(date -u +%FT%TZ)" >> "$LOG/backfill.log"
+    python3.12 backfill.py --log-dir "$LOG" "$@" >> "$LOG/backfill.log" 2>&1
+    code=$?
+    echo "attempt $attempt: runner exit $code at $(date -u +%FT%TZ)" >> "$LOG/backfill.log"
+    if [ -f "$LOG/summary.json" ]; then
+        finished=yes
+        break
+    fi
+    if [ $attempt -gt $MAX_RESTARTS ]; then
+        echo "abnormal exit after $MAX_RESTARTS restarts; giving up" >> "$LOG/backfill.log"
+        break
+    fi
+    echo "abnormal exit (no summary.json); restarting in ${RESTART_DELAY}s" >> "$LOG/backfill.log"
+    ship
+    sleep "$RESTART_DELAY"
+done
+
+if [ $finished = yes ]; then
+    aws cloudwatch disable-alarm-actions --alarm-names "$ALARM" --region $REGION \
+        && echo "clean finish: stall alarm disarmed" >> "$LOG/backfill.log"
+else
+    echo "NOT finished: stall alarm left armed so it reports this" >> "$LOG/backfill.log"
+fi
 
 kill $shipper 2>/dev/null
 ship
