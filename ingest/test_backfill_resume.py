@@ -227,6 +227,34 @@ class ResumeTest(unittest.TestCase):
         self.assertEqual(row["status"], "failed")
         self.assertEqual(int(row["attempt"]), backfill.MAX_ATTEMPTS)
 
+    def test_failures_back_off_before_retrying(self):
+        # A mirror blip must not burn all three attempts inside a few seconds.
+        dead = HOURS[2]
+        self.run_day(self.ingest(fail={dead}))
+        self.assertEqual(self.clock.slept, list(backfill.RETRY_BACKOFF_SECONDS))
+
+    # --- the second pass -------------------------------------------------------
+
+    def test_final_pass_compacts_leftovers_and_explains_the_rest(self):
+        d1, d2, d3, d4 = (DAY + dt.timedelta(days=n) for n in range(4))
+        # d1 compacted already; d2 all done but never compacted (say the
+        # compaction ran out of memory); d3 has a dead hour; d4 blocked.
+        self.table.put_item(Item={"source_hour": f"day#{d1}", "status": "compacted"})
+        for h in backfill.source_hours_for(d2) + backfill.source_hours_for(d3):
+            self.set_hour(h, status="done")
+        dead = backfill.source_hours_for(d3)[4]
+        self.set_hour(dead, status="failed", attempt=backfill.MAX_ATTEMPTS,
+                      error="HTTP Error 404: Not Found")
+        self.table.put_item(Item={"source_hour": f"day#{d4}", "status": "invalidated"})
+
+        left = backfill.final_pass(self.manifest, [d1, d2, d3, d4], self.compact,
+                                   clock=self.clock)
+        self.assertEqual(self.compactions, [d2])
+        self.assertEqual(sorted(left), [str(d3), str(d4)])
+        self.assertIn(dead, left[str(d3)])
+        self.assertIn("404", left[str(d3)])
+        self.assertIn("invalidated", left[str(d4)])
+
     # --- progress -------------------------------------------------------------
 
     def test_progress_lands_in_cloudwatch(self):

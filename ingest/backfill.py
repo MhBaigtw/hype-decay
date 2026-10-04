@@ -82,6 +82,10 @@ WINDOW_END = dt.date(2026, 9, 12)
 
 MAX_ATTEMPTS = 3          # per hour, counted by the manifest's attempt field
 MAX_PASSES = 8            # plan/act rounds per day before giving up on it
+# Waits before the 2nd and 3rd attempt at a failed hour. Without them a
+# minute-long mirror blip would burn all three attempts in seconds and mark a
+# whole day of hours permanently failed.
+RETRY_BACKOFF_SECONDS = (30, 120)
 PARSE_WORKERS = 4         # c7g.xlarge: 4 vCPUs, 4 x 1.6 GiB fits in 7.6 GiB
 METRIC_NAMESPACE = "hype-decay/backfill"
 
@@ -104,6 +108,7 @@ class DayPlan:
     done: list = field(default_factory=list)
     held: list = field(default_factory=list)
     exhausted: list = field(default_factory=list)
+    retrying: list = field(default_factory=list)
     lease_until: int = 0
 
 
@@ -130,6 +135,8 @@ def plan_day(manifest, day, now):
             plan.exhausted.append(hour)
         else:
             plan.todo.append(hour)
+            if st == "failed":
+                plan.retrying.append(hour)
 
     plan.action = ("ingest" if plan.todo else "wait" if plan.held
                    else "incomplete" if plan.exhausted else "compact")
@@ -147,6 +154,7 @@ def run_day(manifest, day, process_hours, compact, clock=time.time, sleep=time.s
               "hour_results": [], "compaction": None, "ingest_secs": 0.0,
               "compact_secs": 0.0, "exhausted": [], "held": []}
 
+    retry_round = 0
     for _ in range(MAX_PASSES):
         report["passes"] += 1
         plan = plan_day(manifest, day, clock())
@@ -169,6 +177,11 @@ def run_day(manifest, day, process_hours, compact, clock=time.time, sleep=time.s
             sleep(wait)
             continue
         if plan.action == "ingest":
+            if plan.retrying:
+                wait = RETRY_BACKOFF_SECONDS[min(retry_round, len(RETRY_BACKOFF_SECONDS) - 1)]
+                retry_round += 1
+                log(f"{day}: retrying {len(plan.retrying)} failed hour(s) after {wait}s")
+                sleep(wait)
             t = clock()
             results = process_hours(plan.todo)
             report["ingest_secs"] += clock() - t
@@ -190,6 +203,41 @@ def run_day(manifest, day, process_hours, compact, clock=time.time, sleep=time.s
 
     report["day_secs"] = clock() - started
     return report
+
+
+def final_pass(manifest, days, compact, clock=time.time):
+    """The second pass: compact every day that can be, explain every one that
+    cannot. Runs after the main loop with nothing else running, so it catches a
+    compaction that failed (out of memory, say) without re-ingesting anything.
+
+    Returns {day: reason} for every day still not compacted afterwards.
+    """
+    left = {}
+    for day in days:
+        plan = plan_day(manifest, day, clock())
+        result = None
+        if plan.action in ("compact", "resume-compaction"):
+            result = compact(day)
+            plan = plan_day(manifest, day, clock())
+        if plan.action == "skip":
+            continue
+        if plan.action == "incomplete":
+            why = []
+            for hour in plan.exhausted:
+                item = manifest.get(hour) or {}
+                why.append(f"{hour} failed {int(item.get('attempt', 0))}x: "
+                           f"{item.get('error', 'no reason recorded')}")
+            left[str(day)] = "hours failed permanently: " + "; ".join(why)
+        elif plan.action == "blocked":
+            row = manifest.get(f"day#{day}") or {}
+            left[str(day)] = (f"day row is {row.get('status')}: "
+                              f"{row.get('error', 'no reason recorded')}")
+        elif result is not None:
+            left[str(day)] = f"compaction did not complete: {result}"
+        else:
+            left[str(day)] = (f"{plan.action}: {len(plan.todo)} hour(s) not done, "
+                              f"{len(plan.held)} leased: {(plan.todo + plan.held)[:4]}")
+    return left
 
 
 # --- the real workers --------------------------------------------------------
@@ -435,8 +483,28 @@ def main():
         if not args.no_metrics:
             publish_progress(cloudwatch, report, days_remaining=len(days) - n - 1)
 
+    log(f"main loop done: {dict(totals)} in {(time.time() - run_started) / 60:.1f} min")
+
+    # --- second pass: compact anything left, explain the rest ----------------
+    log("SECOND PASS: compacting any day not yet compacted, nothing else running")
+    left = final_pass(manifest, days, compact)
+    for day, why in left.items():
+        log(f"  NOT COMPACTED {day}: {why}")
+    log(f"second pass: {len(left)} day(s) not compacted")
+
     elapsed = time.time() - run_started
+    summary = {"window": [str(days[0]), str(days[-1])], "days": len(days),
+               "totals": dict(totals), "not_compacted": left,
+               "elapsed_hours": round(elapsed / 3600, 2),
+               "finished_at": dt.datetime.now(dt.timezone.utc).isoformat()}
+    (Path(args.log_dir) / "summary.json").write_text(json.dumps(summary, indent=2))
+    if not args.no_metrics:
+        cloudwatch.put_metric_data(Namespace=METRIC_NAMESPACE, MetricData=[
+            {"MetricName": "DaysNotCompacted", "Value": float(len(left)), "Unit": "Count"},
+            {"MetricName": "RunComplete", "Value": 1.0, "Unit": "Count"}])
     log(f"done: {dict(totals)} in {elapsed / 60:.1f} min")
+    if left:
+        return 1
     return 0 if totals["hours_failed"] == 0 and set(totals) <= {
         "compacted", "skipped", "hours_ingested", "hours_failed", "s3_requests"} else 1
 
