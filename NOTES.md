@@ -214,3 +214,26 @@ day × 730 × 1.5.
 ever be marked failed. moto caught it, and real DynamoDB confirmed it.
 
 **Breaks at 10x:** compaction memory. It left 1.4 GiB free.
+
+---
+
+## Task 3 — full backfill, run 1 stopped at day 351 (2026-10-04)
+
+**Ran:** `i-0d7641b7a9b0af924`, commit `a3d3b03`, 18 h time box. Launched
+02:22Z. It shut itself down between 07:53Z and about 08:50Z. CloudTrail shows no
+`TerminateInstances`, so nothing outside the box terminated it. The volume
+deleted with it, and state was cleaned by a refresh-only apply.
+
+**Got done:** 8,424 hours `done`, 0 failed. 350 days compacted at floor 10,
+through 2025-08-27. 2025-08-28 has all 24 hours ingested but no day row, so it
+died in that day's compaction.
+
+**Cause, most likely:** memory. The compaction peak ranged from 5.6 to 7.1 GiB by
+day against 7.6 GiB usable, and 19 days fell under 500 MiB free. The final log
+upload never ran, and the disk is gone, so this is inferred, not observed.
+
+**Decision pending:** fix compaction memory before relaunching. Rejected:
+relaunching as-is, which would die again on the next heavy day.
+
+**Breaks at 10x:** whole-day compaction in memory. It does not survive this
+scale now.
