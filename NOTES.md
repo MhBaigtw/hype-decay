@@ -237,3 +237,28 @@ relaunching as-is, which would die again on the next heavy day.
 
 **Breaks at 10x:** whole-day compaction in memory. It does not survive this
 scale now.
+
+---
+
+## Task 3 — Backfill, done (2026-10-05)
+
+**Built:** `backfill.py`, a manifest-driven runner, plus a detached,
+self-terminating wrapper. Run 2 (`i-077613891baaf869c`, 12 h box) ran 8.65 h and
+terminated itself at 03:05Z.
+
+**Which service does what:** EC2 parses, S3 holds the Parquet and the logs,
+DynamoDB holds every decision, CloudWatch carries progress and a stall alarm.
+
+**Verified:** 17,520 of 17,520 hours done, 0 failed. 730 days compacted at floor
+10, each matching the sum of its 24 hourly totals. No partials, leftovers or
+fixtures. Curated zone 52.83 GiB: page_hour 35.84, page_daily 16.99.
+
+**Cost:** 14.42 instance-hours across every launch. $2.82 of October usage plus
+$0.37 tax; no credits applied yet.
+
+**Decision:** incremental compaction, peaking at 4,882 MiB. Rejected: the
+all-at-once engine, which peaked at 7,393 MiB on 2025-08-28 and killed run 1.
+The outputs are identical.
+
+**Breaks at 10x:** one box and three connections. Ten times the window is about
+90 h, and a day with 10x the pages would exhaust memory even incrementally.

@@ -78,6 +78,10 @@ backfill.
 
 ## Task 3 — Backfill
 
+**Status: done, 2026-10-05.** 17,520 of 17,520 hours done, 0 failed; 730 of
+730 days compacted at floor 10 and reconciled to their hours
+(`ingest/verify_backfill.py`). See NOTES, Task 3.
+
 Scale Task 2 to 2 years without getting the owner's IP banned.
 
 - Runs on the time-boxed instance, not a laptop. CLAUDE.md permits exactly one,
