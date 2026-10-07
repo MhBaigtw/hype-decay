@@ -171,6 +171,18 @@ data "aws_iam_policy_document" "backfill" {
     resources = ["arn:aws:cloudwatch:${var.region}:${data.aws_caller_identity.current.account_id}:alarm:${var.project}-backfill-stall"]
   }
 
+  # The wrapper waits for the alarm to read OK before arming it, so arming never
+  # lands mid-recovery and turns the start of every run into a recovery email.
+  # Read-only, and granted on "*" rather than an alarm ARN on purpose: if a
+  # resource-scoped grant were wrong, the read would fail and the wrapper would
+  # wait out its fallback instead of arming promptly -- a silent degradation.
+  statement {
+    sid       = "ReadAlarmState"
+    effect    = "Allow"
+    actions   = ["cloudwatch:DescribeAlarms"]
+    resources = ["*"]
+  }
+
   # Deny everything expensive outright, exactly as the deploy role does. An
   # instance with credentials is a place where a mistake becomes a bill.
   statement {
@@ -296,12 +308,16 @@ resource "aws_instance" "backfill" {
 # row where DaysCompacted sums below 1. Missing data counts as breaching, since
 # a dead box publishes nothing at all, which is the case that matters most.
 #
-# It exists only alongside the instance (same count), and its ACTIONS are armed
-# by run_backfill.sh when the runner starts and disarmed after a clean finish.
-# So it is silent between runs, but a box that dies mid-run leaves it armed and
-# it reports. ignore_changes stops Terraform fighting the wrapper over that
-# flag. It publishes to the bootstrap-owned alerts topic, referenced by name
-# because the two modules keep separate state.
+# It exists only alongside the instance (same count) and is CREATED DISARMED.
+# Run 2 created it armed: with no data yet and missing data breaching, it went
+# to ALARM within seconds of creation and emailed a false stall before the first
+# day had even started. Now run_backfill.sh arms it only once the first day has
+# compacted AND the alarm reads OK, and disarms it after a clean finish. So it
+# is silent at launch and between runs, but a box that dies mid-run leaves it
+# armed, and both the stall and the recovery (ok_actions) are emailed.
+# ignore_changes stops Terraform fighting the wrapper over the flag. It
+# publishes to the bootstrap-owned alerts topic, referenced by name because the
+# two modules keep separate state.
 #
 # Cost: one standard alarm, $0.10/month prorated, for as long as it exists.
 
@@ -322,7 +338,9 @@ resource "aws_cloudwatch_metric_alarm" "backfill_stall" {
   comparison_operator = "LessThanThreshold"
   treat_missing_data  = "breaching"
 
-  alarm_actions = ["arn:aws:sns:${var.region}:${data.aws_caller_identity.current.account_id}:${var.project}-alerts"]
+  actions_enabled = false
+  alarm_actions   = ["arn:aws:sns:${var.region}:${data.aws_caller_identity.current.account_id}:${var.project}-alerts"]
+  ok_actions      = ["arn:aws:sns:${var.region}:${data.aws_caller_identity.current.account_id}:${var.project}-alerts"]
 
   tags = { Task = "task-3-backfill" }
 

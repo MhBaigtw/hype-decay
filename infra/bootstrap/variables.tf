@@ -77,7 +77,10 @@ variable "create_tripwire_test_budget" {
     for the first two budgets, and two is all we have.
   EOT
   type        = bool
-  default     = true
+  # Proven 2026-10-02: the tripwire email arrived ($0.08 actual against $0.01),
+  # once credits were excluded. The budget alert path works end to end, so the
+  # test budget is retired.
+  default = false
 }
 
 variable "athena_scan_limit_bytes" {

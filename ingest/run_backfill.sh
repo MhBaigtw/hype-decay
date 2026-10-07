@@ -14,9 +14,14 @@
 # times. The manifest makes a restart lose and repeat nothing.
 #
 # STALL ALARM. hype-decay-backfill-stall fires if no day is compacted for 20
-# minutes. Its actions are enabled here at start and disabled only after a
-# clean finish, so it is silent between runs but does fire if this box dies
-# mid-run -- exactly the case run 1 went unnoticed in.
+# minutes. Terraform creates it disarmed. This script arms it only after the
+# first day has compacted and the alarm reads OK -- arming any earlier either
+# sends a false stall (no data yet reads as breaching) or, with ok_actions, a
+# false recovery on every launch. If it has not read OK within 10 minutes of the
+# first compaction it is armed anyway: a run that stalls straight after its
+# first day must still report. Disarmed again only after a clean finish, so it
+# stays silent between runs but fires if the box dies mid-run -- the case run 1
+# went unnoticed in.
 #
 # Whatever the runner's exit code, the box shuts down when it ends, and it is set
 # to TERMINATE on shutdown, so finishing early stops the bill early. The
@@ -53,8 +58,20 @@ shipper=$!
 
 cd "$HOME_DIR/ingest"
 echo "run $RUN_ID, commit $(cat "$HOME_DIR/COMMIT"), args: $*" > "$LOG/backfill.log"
-aws cloudwatch enable-alarm-actions --alarm-names "$ALARM" --region $REGION \
-    && echo "stall alarm armed" >> "$LOG/backfill.log"
+arm_after_first_compaction() {
+    until grep -q '"outcome": "compacted"' "$LOG/days.jsonl" 2>/dev/null; do sleep 15; done
+    local waited=0
+    until [ "$(aws cloudwatch describe-alarms --alarm-names "$ALARM" --region $REGION \
+               --query 'MetricAlarms[0].StateValue' --output text 2>/dev/null)" = OK ] \
+          || [ $waited -ge 600 ]; do
+        sleep 15; waited=$((waited + 15))
+    done
+    aws cloudwatch enable-alarm-actions --alarm-names "$ALARM" --region $REGION \
+        && echo "stall alarm armed $(date -u +%FT%TZ), after the first compacted day" \
+                "(waited ${waited}s for OK)" >> "$LOG/backfill.log"
+}
+arm_after_first_compaction &
+armer=$!
 
 attempt=0
 finished=no
@@ -78,6 +95,7 @@ while :; do
     sleep "$RESTART_DELAY"
 done
 
+kill $armer 2>/dev/null   # never arm after the run has ended
 if [ $finished = yes ]; then
     aws cloudwatch disable-alarm-actions --alarm-names "$ALARM" --region $REGION \
         && echo "clean finish: stall alarm disarmed" >> "$LOG/backfill.log"
