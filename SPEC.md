@@ -334,6 +334,16 @@ month before and after, and fails unless D is as intended and no other day
 changed. A refloor of a retired day is refused by `compact_day.py`: there is no
 staging file left to refloor.
 
+**Where a correction runs.** A single-day correction may run from the laptop:
+the one proof run (2025-03-15) did, with 24 downloads on one connection and one
+compaction. **Any correction touching more than one day runs on the backfill
+instance, not the laptop.** Three reasons, all measured: a day's compaction
+peaks at 3.0 to 4.9 GiB and the laptop had 0.5 GiB free, so it pages; every day
+is about 1.4 GB fetched, which belongs on an AWS network rather than the home
+connection the Wikimedia rate limits apply to; and the instance's wrapper, stall
+alarm and self-termination make a multi-hour job safe to leave, where a laptop
+that sleeps -- as it did during backfill run 1's monitoring -- simply stops.
+
 ## v1 acceptance
 
 v1 is done when all of these are true:

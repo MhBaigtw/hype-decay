@@ -262,3 +262,41 @@ The outputs are identical.
 
 **Breaks at 10x:** one box and three connections. Ten times the window is about
 90 h, and a day with 10x the pages would exhaust memory even incrementally.
+
+---
+
+## Guardrails — both alert paths proven (2026-10-07)
+
+**Budget path:** the $0.01 tripwire budget emailed on 2026-10-02, $0.08 actual
+against $0.01, once it stopped counting credits. The test budget is now retired.
+
+**SNS alarm path:** the backfill stall alarm emailed through the
+`hype-decay-alerts` topic on 2026-10-04 (a false stall at launch, since fixed).
+
+So a budget breach and a CloudWatch alarm both reach the inbox. The stall alarm
+is now created disarmed, armed only after the first compacted day, and sends
+`ok_actions` on recovery.
+
+---
+
+## Task 4 — Curated zone in the Glue Data Catalog, as Iceberg (2026-10-07)
+
+**Built:** `hype_decay.page_hour` and `page_daily` in Iceberg, partitioned by
+`dt` and sorted by title. Glue holds the catalog, Athena writes and queries the
+tables, S3 stores them, and DynamoDB records each day's publish state.
+
+**Decision:** an Athena rewrite. Rejected: Glue `add_files` over the existing
+files. On March 2025 the rewrite stored `page_hour` 5.4x smaller and scanned
+10.5x fewer bytes per page lookup. Adopting the files would have kept 17,520
+unsorted hourly files that have no `dt` column.
+
+**Verified:** all 730 days matched the old copy by rows, views and row checksum
+before the old copy was deleted. Both tables match the manifest per day and per
+hour. 15 of 15 spot checks matched the REST API exactly. The curated zone shrank
+from 52.83 GiB to 18.49 GiB. About 145 GiB was scanned overall, roughly $0.71.
+
+**Correction path:** `republish_day.py` replaces a day with DELETE then INSERT.
+Proven on 2025-03-15: identical result, no other day touched.
+
+**Breaks at 10x:** `page_daily` lookups read the whole title column, 14.4 MiB
+a day, with nothing to skip. Ten times the pages exceeds the dbt cap.

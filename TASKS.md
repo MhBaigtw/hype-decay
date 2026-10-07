@@ -106,6 +106,15 @@ explicitly failed with a reason, and the failure count is under 1%.
 
 ## Task 4 — Source to curated
 
+**Status: done, 2026-10-07, re-scoped by the owner.** The ingester already
+writes partitioned Parquet, so the Glue conversion job below was not needed.
+Delivered instead: `page_hour` and `page_daily` as Iceberg tables in the Glue
+Data Catalog, queryable in Athena with partition pruning; rewrite chosen over
+`add_files` on measurement; all 730 days verified identical and against the
+manifest; 15/15 REST spot checks exact; scanned bytes with and without a
+partition filter recorded in the README. See NOTES, Task 4. The original
+scope follows, for the record.
+
 Glue Spark job, max 10 DPU, 30 minute timeout.
 
 - Parse the 4-column `pageviews` format. `pageview_complete` is out of scope,
