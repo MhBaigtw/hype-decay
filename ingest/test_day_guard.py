@@ -122,6 +122,8 @@ class GuardTest(unittest.TestCase):
         self.assertEqual(row["status"], "invalidated")
         self.assertEqual(row["invalidated_by"], "2026-09-10T18")
         self.assertEqual(int(row["views_previous"]), 1000)
+        # Not recorded on this row, so marked -1 rather than failing the write.
+        self.assertEqual(int(row["views_unfloored_previous"]), -1)
         # day.parquet is gone from the readable partition ...
         self.assertEqual(self.readable_keys(), [])
         # ... but kept, out of the reader's path, until a recompaction succeeds.
@@ -138,6 +140,13 @@ class GuardTest(unittest.TestCase):
                            force=False)
         self.assertEqual(action, "open")
         self.assertEqual(self.readable_keys(), [])
+
+    def test_invalidation_copies_unfloored_totals(self):
+        self.set_day("compacted", views_unfloored=5000, rows_unfloored=40)
+        guard_day(self.manifest, self.s3, BUCKET, DAY, "2026-09-10T18", force=True)
+        row = self.table.get_item(Key={"source_hour": f"day#{DAY}"})["Item"]
+        self.assertEqual((int(row["rows_unfloored_previous"]),
+                          int(row["views_unfloored_previous"])), (40, 5000))
 
     def test_second_force_does_not_reinvalidate(self):
         self.set_day("compacted")

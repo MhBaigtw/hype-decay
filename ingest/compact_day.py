@@ -390,6 +390,12 @@ def refloor(s3, manifest, args, day, row):
     """--force on a compacted day: re-read day.parquet, apply a higher floor."""
     previous = int(row.get("floor_applied", 0))
     log(f"REFLOOR: day is compacted at floor {previous}, asked for floor {args.floor}")
+    if row.get("staging_removed_at"):
+        # Published to Iceberg and its staging day.parquet retired: there is no
+        # file here to refloor. Refloor in Iceberg, or republish_day.py.
+        log("refusing: this day's staging copy was retired after publishing to "
+            "Iceberg; refloor it there, or correct it with republish_day.py")
+        return 2
     if not refloor_allowed(previous, args.floor):
         log(f"refusing: rows under floor {previous} were dropped at compaction and")
         log("exist nowhere but the source. Lowering the floor is a re-ingest.")
@@ -548,7 +554,15 @@ def _main():
     # day it replaced: same pages, same views. More means an hour was counted
     # twice; fewer means one was lost. Only comparable when the invalidated day
     # was itself unfloored.
-    if status == "invalidated" and int(row.get("floor_applied", 0)) == 0:
+    # A floored day is compared on the unfloored totals the invalidation copied.
+    if status == "invalidated" and int(row.get("rows_unfloored_previous", -1)) >= 0:
+        before_rows = int(row["rows_unfloored_previous"])
+        before_views = int(row["views_unfloored_previous"])
+        same = before_rows == unfloored_rows and before_views == unfloored_views
+        log(f"rebuild vs invalidated day (unfloored): rows {before_rows:,} -> "
+            f"{unfloored_rows:,}, views {before_views:,} -> {unfloored_views:,} -- "
+            + ("UNCHANGED" if same else "CHANGED"))
+    elif status == "invalidated" and int(row.get("floor_applied", 0)) == 0:
         before_rows = int(row.get("rows_previous", 0))
         before_views = int(row.get("views_previous", 0))
         same = before_rows == unfloored_rows and before_views == unfloored_views

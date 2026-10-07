@@ -308,12 +308,16 @@ class Manifest:
                 Key={"source_hour": f"day#{day}"},
                 UpdateExpression=(
                     "SET #s = :inv, invalidated_by = :hour, invalidated_at = :now, "
-                    "views_previous = #v, rows_previous = #r, key_quarantine = :q"),
+                    "views_previous = #v, rows_previous = #r, key_quarantine = :q, "
+                    # Unfloored totals too, so a floored day's rebuild can be
+                    # checked before the floor is applied. -1 = never recorded.
+                    "views_unfloored_previous = if_not_exists(views_unfloored, :none), "
+                    "rows_unfloored_previous = if_not_exists(rows_unfloored, :none)"),
                 ConditionExpression="#s = :compacted",
                 ExpressionAttributeNames={"#s": "status", "#v": "views", "#r": "rows"},
                 ExpressionAttributeValues={
                     ":inv": "invalidated", ":compacted": "compacted",
-                    ":hour": hour_key, ":q": quarantine_key(day),
+                    ":hour": hour_key, ":q": quarantine_key(day), ":none": -1,
                     ":now": dt.datetime.now(dt.timezone.utc).isoformat()},
             )
             return True

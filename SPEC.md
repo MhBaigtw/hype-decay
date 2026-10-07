@@ -185,12 +185,20 @@ scope and will not be attempted.
 ## Storage model
 
 ```
-s3://<bucket>/curated/page_daily/dt=.../part-<source hour>.parquet   hourly partial
-s3://<bucket>/curated/page_daily/dt=.../day.parquet                  compacted day
-s3://<bucket>/curated/page_hour/            Parquet, Hive-partitioned dt=/hour=
+s3://<bucket>/curated/iceberg/page_hour/     Iceberg, partitioned by dt, sorted by page_title
+s3://<bucket>/curated/iceberg/page_daily/    Iceberg, partitioned by dt, sorted by page_title
+s3://<bucket>/curated/page_daily/dt=.../part-<source hour>.parquet   ingest staging: hourly partial
+s3://<bucket>/curated/page_daily/dt=.../day.parquet                  ingest staging: compacted day
+s3://<bucket>/curated/page_hour/dt=/hour=/  ingest staging: plain Parquet, one file per hour
 s3://<bucket>/marts/                        dbt outputs
 s3://<bucket>/fixtures/raw_48h/*.gz         48 hours of source gz, fixture only
 ```
+
+Since Task 4 the Iceberg tables `hype_decay.page_hour` and `hype_decay.page_daily`
+are the curated zone and the only thing anything downstream reads. The plain
+Parquet prefixes are where the ingester and the compactor stage their output;
+the two-year backfill's copy there was deleted once the Iceberg tables were
+verified identical to it (NOTES, Task 4).
 
 **There is no persistent raw zone.** Conversion to Parquet happens in flight
 during the backfill transfer. No untouched copy of the source is retained.
@@ -245,12 +253,12 @@ silent wrong answer. The manifest day row is the authority on which days are
 compacted.
 
 **Who writes which format.** The ingester writes plain Parquet with Hive-style
-partition prefixes (`dt=`, `hour=`). Glue creates and maintains the Iceberg
-tables, in Task 4, reading what the ingester wrote.
+partition prefixes (`dt=`, `hour=`). Athena creates the Iceberg tables and
+writes into them from that staging copy (Task 4).
 
 Reasoning: writing Iceberg from the ingester would put a pyiceberg and
 Glue-catalog dependency inside a script whose entire job is one HTTP GET, one
-parse and three PUTs, and it would duplicate catalog work that the Glue job does
+parse and three PUTs, and it would duplicate catalog work that Athena does
 natively. Keeping table format in one place keeps the ingester something that can
 be read in one sitting.
 
@@ -260,36 +268,71 @@ atomic commits over the curated zone, so a reader can see a half-written day. Th
 complete. Task 2 wrote plain Parquet while this spec still said Iceberg; this
 paragraph replaces that silent divergence.
 
-**Task 4 ADOPTS the Parquet in place; it does not rewrite it.** Glue registers an
-Iceberg table over the files the ingester already wrote, using the `add_files`
-procedure, which writes Iceberg metadata pointing at existing objects and copies
-no data.
+**Task 4 REWRITES into Iceberg; it does not adopt the files in place.** This
+reverses the earlier decision in this spec, which favoured Glue's `add_files`
+procedure to avoid holding two copies. Measured on March 2025 of `page_hour`
+(NOTES, Task 4), an Athena `INSERT ... ORDER BY dt, page_title` into Iceberg:
 
-Why not a rewrite: a CTAS into a fresh Iceberg table would hold two complete
-copies of the curated zone until the originals were deleted, roughly doubling
-curated storage for the duration. At an estimated 70 to 90 GiB curated that is
-about $2/month of transient double storage against a $30 total budget, for no
-gain in the data itself.
+- stored the month in 313 MiB instead of 1,699 MiB, 5.4x smaller, because a
+  title's 24 hours sit together and compress to almost nothing, and zstd
+  replaces snappy
+- scanned 10.5x fewer bytes for one page's curve across the month, the lookup
+  Task 7 serves, and 1.3x fewer for per-day totals
+- replaced one 2 MiB file per hour, each spanning the whole alphabet, with
+  about 9 files per day
 
-What adoption gives up: adopted files keep the layout, file sizes and sort order
-they were written with, so Iceberg cannot retroactively improve clustering. If a
-model later needs sorted or larger files, `rewrite_data_files` can be run one
-partition at a time, so the peak extra storage is one partition rather than the
-whole table.
+Adoption would have kept all of that as it was: 17,520 files, unsorted, with no
+`dt` column inside the `page_hour` files for an Iceberg partition to be built
+from. The double storage the earlier reasoning feared lasts only between the
+build and the verification, hours rather than months, at under a cent.
 
-**`add_files` runs on compacted days only, and adoption is one-way.** A day is
-eligible once `compact_day.py` has replaced its 24 partials with one object and
-the manifest `day#` row says `compacted`. Adopting a day that is still partials
-would register 24 files that compaction is about to delete, and Iceberg metadata
-pointing at deleted files is a broken table, not a stale one.
+Athena writes these files without min/max statistics on `page_title`, so a page
+lookup cannot skip row groups by title; the saving comes from the sorted column
+being small, not from skipping. Partitioning by `dt` is what prunes.
 
-**Once Iceberg owns a table, nothing deletes files behind it.** Compaction
-deletes partials, so compaction must finish BEFORE adoption, never after. From
-the moment a table is adopted, new days are written THROUGH Iceberg -- an Iceberg
-append, not a bare PUT followed by `add_files` -- because a file that appears in
-S3 without a metadata commit is invisible to readers, and a file removed without
-one makes every snapshot that references it unreadable. The manifest stays the
-record of what was fetched; Iceberg becomes the record of what is queryable.
+**Once Iceberg owns a table, nothing writes or deletes files behind it.** New
+days are written THROUGH Iceberg -- an Athena `INSERT` from the staging prefix,
+once a day is compacted -- never by putting a file under `curated/iceberg/`. A
+file that appears there without a metadata commit is invisible to readers, and a
+file removed without one makes every snapshot that references it unreadable.
+The manifest stays the record of what was fetched; Iceberg is the record of
+what is queryable.
+
+**Publishing a day, and what the manifest says about it.** `ingest/publish.py`.
+A compacted day is published by replacing that `dt` in both Iceberg tables from
+its staging copy, then checking the result against the manifest: `page_daily`
+rows and views against the day row, `page_hour` rows per hour against each hour
+row's `rows_page_hour`. The day row records it:
+
+- `iceberg_state`: `replacing` while the DELETE and INSERT run, `published` once
+  they matched the manifest; `iceberg_published_at` and `iceberg_state_at`
+- `staging_removed_at`: when the staging `day.parquet` and the day's 24
+  `page_hour` staging files were deleted. At the same moment the fields that
+  named them -- `key_compacted` on the day row, `key_page_hour` and
+  `key_page_daily` on its hour rows -- are REMOVED. The manifest never names a
+  file that does not exist.
+
+Staging is retired only for a day whose `iceberg_state` is `published`: it is
+the only other copy until then.
+
+**Correcting a day after the switch.** `ingest/republish_day.py --dt D`:
+
+1. re-ingest D's 24 source hours with `--force`. The day row flips to
+   `invalidated` (double-count guard) and the partials come back to staging.
+2. recompact. Built from exactly those 24 partials, and checked against the
+   totals the invalidation recorded.
+3. replace D in Iceberg: `DELETE ... WHERE dt = D`, then `INSERT ... SELECT`
+   from staging, in each table, then check against the manifest. Never an INSERT
+   alongside the old rows -- that is a double count inside Iceberg. Between the
+   DELETE and the INSERT a reader sees D empty: a gap, never twice. A `MERGE`
+   would be one commit, but Athena's has no `WHEN NOT MATCHED BY SOURCE`, so it
+   could not remove a row the corrected data no longer has.
+4. retire D's staging copy, as above.
+
+The script snapshots rows, views and a row-level checksum for every day of D's
+month before and after, and fails unless D is as intended and no other day
+changed. A refloor of a retired day is refused by `compact_day.py`: there is no
+staging file left to refloor.
 
 ## v1 acceptance
 
