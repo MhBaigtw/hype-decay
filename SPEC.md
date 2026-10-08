@@ -75,6 +75,16 @@ registering as a spike. A page can only open one spike per 30-day window;
 if it qualifies again inside that window, extend the existing spike rather
 than opening a new one.
 
+The 30-day window is anchored at the spike's START day (Task 5): a page that
+qualifies again fewer than 30 days after the start extends that spike; 30 or
+more days after the start, it opens a new one. Anchoring at the most recent
+qualifying day instead would let a page that qualifies every few weeks chain one
+spike indefinitely. A spike's start is 00:00 UTC of its first qualifying day.
+
+**Evaluation starts 30 days into the window.** The baseline needs 28 days ending
+2 days before, so the first 30 days of the window (2024-09-13 to 2024-10-12)
+cannot have a complete baseline and are not evaluated for spikes.
+
 **`peak_hour`** — the hour with maximum `views` within 48 hours of spike start.
 
 **`peak_excess`** — `views(peak_hour) - baseline_hourly`.
@@ -90,6 +100,34 @@ ending the measurement early.
 `half_life_hours = NULL` and `is_censored = true`. Report the censored rate
 prominently. Some spikes genuinely never decay because the event permanently
 changed how often the page is read, and hiding that is dishonest.
+
+Censoring is TWO flags, reported separately (Task 5), because they mean
+opposite things:
+
+- `never_halved` -- all 30 days after the peak were observed and the excess
+  never fell to half. A real finding about the page.
+- `window_end` -- the data ends before 30 days after the peak, so it may yet
+  halve. An artefact of where the data stops, nothing about the page.
+
+The 40% stop rule (TASKS, Task 5) applies to `never_halved` only.
+
+**Hourly zero-fill.** The half-life is measured over an hour spine for each
+spike, from 48 hours before its peak to 30 days after (plus the 2 hours the
+debounce needs), capped at the last hour of data. A spine hour with no
+`page_hour` row is 0. That is sound because all 17,520 source hours are present
+(Task 3, verified): a missing page-hour therefore means fewer than 10 views, not
+missing data. The true value is 0 to 9, so an excess near zero is understated by
+at most 9 -- the reason SPEC already advises checking a half-life measured near
+the floor.
+
+**`flat_profile`** -- advisory, never a filter (CLAUDE.md). Human attention has
+a daily rhythm; crawlers do not. For each UTC day from the peak's day through 6
+days after, with 240+ views (10 an hour on average), each hour's share of the
+day; averaged per hour of day; `diurnal_amplitude` = (max - min) of those 24
+mean shares, relative to a flat 1/24. A spike is flagged when it has at least
+`flat_profile_min_days` such days and its amplitude is below
+`flat_profile_max_amplitude` (dbt vars, calibrated in Task 5: NOTES). A spike
+without enough active days is not flagged either way.
 
 ## Curated grain — two tiers
 
@@ -111,11 +149,13 @@ cosmetic tail of the decay curve.
 
 **Known limitation.** Below the floor, an hour with 0 views and an hour dropped
 by the floor are indistinguishable in `page_hour`. The tail of a decay curve is
-truncated, not measured. Anything reading `page_hour` must treat a missing hour
-as unknown, never as zero — the same rule that applies to a missing source
-file. One consequence worth watching: for a spike that only just qualifies, half
-of `peak_excess` can land near the floor, so verify against `page_daily` before
-trusting a half-life measured near it.
+truncated, not measured. A missing SOURCE hour would be unknown, never zero --
+but Task 3 verified all 17,520 source hours present, so since Task 5 a missing
+page-hour is read as fewer than 10 views and zero-filled (see Definitions,
+hourly zero-fill). Were a source hour ever missing, that rule would have to be
+re-examined before any model ran over it. One consequence worth watching: for
+a spike that only just qualifies, half of `peak_excess` can land near the floor,
+so verify against `page_daily` before trusting a half-life measured near it.
 
 ## Exclusions
 
@@ -125,6 +165,17 @@ Drop before analysis:
   `Category:`, `Template:`, `Help:`, `Portal:`, `Wikipedia:`, `User:`
 - the literal title `-`
 - titles that fail UTF-8 decoding
+
+Applied at ingest, and applied again in dbt staging (`stg_page_daily`,
+`stg_page_hour`) so no model depends on the ingester having done it. A test
+(`assert_no_excluded_titles_in_staging`) proves none survive, and spells the
+rules out literally rather than reusing the macro, so a bug in one cannot hide
+in the other.
+
+**Candidate pages (Task 5).** Any page with at least one day of 1,000+ views is
+a candidate, materialized once as `int_candidate_pages`. Every later model joins
+against it rather than the full history: a spike day must clear 1,000, so no
+other page can spike, and `page_daily` cannot be read page by page affordably.
 
 `Main_Page` alone will dominate every leaderboard if it survives.
 

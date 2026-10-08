@@ -23,3 +23,17 @@ output "glue_database" {
   description = "Glue Data Catalog database holding the curated tables."
   value       = aws_glue_catalog_database.curated.name
 }
+
+# dbt's models (Task 5) live in their own database, so `dbt run` can create and
+# drop tables there without any reach into the curated tables it reads from.
+resource "aws_glue_catalog_database" "dbt" {
+  name        = "${replace(var.project, "-", "_")}_dbt"
+  description = "hype-decay dbt models: staging views, intermediate and mart tables. Task 5."
+
+  tags = { Task = "task-5-dbt" }
+}
+
+output "glue_dbt_database" {
+  description = "Glue database holding the dbt models."
+  value       = aws_glue_catalog_database.dbt.name
+}

@@ -1,0 +1,6 @@
+# dbt for Task 5, in its OWN venv on Python 3.12:
+#   py -3.12 -m venv transform/.venv-dbt
+#   transform/.venv-dbt/Scripts/python -m pip install -r transform/requirements.txt
+# Why not the ingest venv (3.13): dbt-athena pins mmh3<4.2, which publishes no
+# Windows wheel for 3.13 and will not build without a C++ toolchain.
+dbt-athena==1.11.1

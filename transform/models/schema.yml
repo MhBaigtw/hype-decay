@@ -1,0 +1,103 @@
+version: 2
+
+models:
+  - name: stg_page_daily
+    description: Cleaned daily grain, SPEC exclusions applied, window-filtered on dt.
+    columns:
+      - name: page_title
+        data_tests: [not_null]
+      - name: dt
+        data_tests: [not_null]
+      - name: daily_views
+        data_tests: [not_null, non_negative]
+
+  - name: stg_page_hour
+    description: Cleaned hourly grain (views >= 10), SPEC exclusions applied.
+    columns:
+      - name: page_title
+        data_tests: [not_null]
+      - name: hour_start
+        data_tests: [not_null]
+      - name: views
+        data_tests: [not_null, non_negative]
+
+  - name: int_candidate_pages
+    description: Every page with a day of 1,000+ views. Materialized once; every later model joins against it.
+    columns:
+      - name: page_title
+        data_tests: [unique, not_null]
+
+  - name: int_page_daily
+    description: Candidate pages x every day of the window, zero-filled; NULL on a day whose source is incomplete.
+    data_tests:
+      - unique_combination:
+          arguments:
+              combination: [page_title, dt]
+    columns:
+      - name: page_title
+        data_tests: [not_null]
+      - name: dt
+        data_tests: [not_null]
+      - name: daily_views
+        data_tests: [non_negative]
+
+  - name: int_baselines
+    description: Exact 28-day median baseline ending 2 days before, for candidate page-days that could qualify.
+    data_tests:
+      - unique_combination:
+          arguments:
+              combination: [page_title, dt]
+    columns:
+      - name: page_title
+        data_tests: [not_null]
+      - name: dt
+        data_tests: [not_null]
+      - name: baseline
+        data_tests: [non_negative]
+
+  - name: int_spikes
+    description: One row per spike, after the 30-day merge rule.
+    data_tests:
+      - unique_combination:
+          arguments:
+              combination: [page_title, spike_start]
+    columns:
+      - name: spike_id
+        data_tests: [unique, not_null]
+      - name: page_title
+        data_tests: [not_null]
+      - name: spike_start
+        data_tests: [not_null]
+
+  - name: int_spike_hours
+    description: Zero-filled hourly views over each spike's hour spine.
+    data_tests:
+      - unique_combination:
+          arguments:
+              combination: [spike_id, hour_start]
+    columns:
+      - name: spike_id
+        data_tests: [not_null]
+      - name: views
+        data_tests: [not_null, non_negative]
+
+  - name: fct_half_life
+    description: One row per spike with peak, half-life, both censoring flags and the flat-profile flag.
+    columns:
+      - name: spike_id
+        data_tests: [unique, not_null]
+      - name: peak_hour
+        data_tests: [not_null]
+      - name: peak_views
+        data_tests: [not_null, non_negative]
+      - name: half_life_hours
+        data_tests:
+          - non_negative
+          - accepted_range_nullable:
+              arguments:
+                min_value: 1
+                max_value: 720
+      - name: never_halved
+        data_tests: [not_null]
+      - name: window_end
+        data_tests: [not_null]

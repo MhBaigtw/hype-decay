@@ -1,0 +1,143 @@
+version: 2
+
+# Unit tests run the real model SQL on Athena against small fixtures, so the
+# logic is checked without scanning a byte of the curated tables.
+
+unit_tests:
+
+  # --- SPEC worked example, part 1: the spine zero-fills -----------------------
+  # A page whose window holds 26 days at 5 views and 2 days at 400. At floor 10
+  # the 26 quiet days have NO row in page_daily, so stg_page_daily has only the
+  # two 400s and the 1,500-view day. The spine must turn every missing complete
+  # day into 0 -- and a day missing from complete_days (2025-01-15 here, an
+  # incomplete source day) into NULL, never 0.
+  - name: int_page_daily_zero_fills_the_worked_example
+    model: int_page_daily
+    overrides:
+      vars: {window_start: "2025-01-01", window_end: "2025-01-31"}
+    given:
+      - input: ref('int_candidate_pages')
+        rows:
+          - {page_title: P}
+      - input: ref('stg_page_daily')
+        rows:
+          - {page_title: P, dt: 2025-01-10, daily_views: 400}
+          - {page_title: P, dt: 2025-01-20, daily_views: 400}
+          - {page_title: P, dt: 2025-01-31, daily_views: 1500}
+      - input: ref('complete_days')
+        format: sql
+        rows: |
+          select cast(d as date) as dt, 24 as hours_done
+          from unnest(sequence(date '2025-01-01', date '2025-01-31', interval '1' day)) as t(d)
+          where d != date '2025-01-15'
+    expect:
+      format: sql
+      rows: |
+        select 'P' as page_title, cast(d as date) as dt,
+               case when d = date '2025-01-15' then cast(null as bigint)
+                    when d in (date '2025-01-10', date '2025-01-20') then cast(400 as bigint)
+                    when d = date '2025-01-31' then cast(1500 as bigint)
+                    else cast(0 as bigint) end as daily_views,
+               d not in (date '2025-01-10', date '2025-01-20', date '2025-01-31') as zero_filled,
+               d != date '2025-01-15' as source_complete
+        from unnest(sequence(date '2025-01-01', date '2025-01-31', interval '1' day)) as t(d)
+
+  # --- SPEC worked example, part 2: the baseline over the zero-filled spine ---
+  # For 2025-01-31 the window is rows 2025-01-02 .. 2025-01-29: 26 zeros and two
+  # 400s, so the median is 0 -- not the 400 a median over existing rows gives.
+  # Page Q is the same with 2025-01-15 NULL (incomplete source): left out, so 27
+  # values, median still 0. 2025-01-31 is the first evaluable day
+  # (window_start + 30), so it is the only row out.
+  - name: int_baselines_worked_example_is_zero_not_400
+    model: int_baselines
+    overrides:
+      vars: {window_start: "2025-01-01", evaluation_offset_days: 30}
+    given:
+      - input: ref('int_page_daily')
+        format: sql
+        rows: |
+          select p as page_title, cast(d as date) as dt,
+                 case when p = 'Q' and d = date '2025-01-15' then cast(null as bigint)
+                      when d in (date '2025-01-10', date '2025-01-20') then cast(400 as bigint)
+                      when d = date '2025-01-31' then cast(1500 as bigint)
+                      else cast(0 as bigint) end as daily_views
+          from unnest(sequence(date '2025-01-01', date '2025-01-31', interval '1' day)) as t(d)
+          cross join unnest(array['P', 'Q']) as u(p)
+    expect:
+      rows:
+        - {page_title: P, dt: 2025-01-31, daily_views: 1500, baseline_days: 28, baseline: 0.0}
+        - {page_title: Q, dt: 2025-01-31, daily_views: 1500, baseline_days: 27, baseline: 0.0}
+
+  # --- SPEC worked example, part 3, and the 30-day rule ------------------------
+  # P (zero-filled baseline 0) qualifies at 1,500. N carries the naive baseline
+  # of 400: 1,500 < 5 x 400, so it does NOT -- the real spike the SPEC says a
+  # median over existing rows misses. T fails the 1,000 floor. R qualifies on
+  # Feb 1, Feb 20, Mar 3 and Mar 10: Feb 20 is within 30 days of the Feb 1 start
+  # and extends it; Mar 3 is exactly 30 days later and opens a new spike, which
+  # Mar 10 extends.
+  - name: int_spikes_qualify_and_merge
+    model: int_spikes
+    given:
+      - input: ref('int_baselines')
+        rows:
+          - {page_title: P, dt: 2025-01-31, daily_views: 1500, baseline_days: 28, baseline: 0.0}
+          - {page_title: N, dt: 2025-01-31, daily_views: 1500, baseline_days: 28, baseline: 400.0}
+          - {page_title: T, dt: 2025-01-31, daily_views: 900, baseline_days: 28, baseline: 10.0}
+          - {page_title: R, dt: 2025-02-01, daily_views: 5000, baseline_days: 28, baseline: 100.0}
+          - {page_title: R, dt: 2025-02-20, daily_views: 5000, baseline_days: 28, baseline: 100.0}
+          - {page_title: R, dt: 2025-03-03, daily_views: 5000, baseline_days: 28, baseline: 100.0}
+          - {page_title: R, dt: 2025-03-10, daily_views: 5000, baseline_days: 28, baseline: 100.0}
+    expect:
+      rows:
+        - {spike_id: "P|2025-01-31", page_title: P, spike_start: 2025-01-31, qualifying_days: 1}
+        - {spike_id: "R|2025-02-01", page_title: R, spike_start: 2025-02-01, qualifying_days: 2}
+        - {spike_id: "R|2025-03-03", page_title: R, spike_start: 2025-03-03, qualifying_days: 2}
+
+  # --- One spike by hand: peak, debounce, half-life, both censoring flags ------
+  # A: baseline_hourly 1, peak 101 views at 03:00, so peak_excess 100 and the
+  # half line is 50 excess (51 views). 05:00 dips to 40 but 06:00 is back at 60,
+  # so the 3-hour debounce rejects 05:00. 07:00, 08:00 and 09:00 are all below:
+  # half-life = 07:00 - 03:00 = 4 hours. The 0s are zero-filled hours (<10 views).
+  # B never comes down, and 30 days after its peak lie inside the data:
+  # never_halved. C never comes down, but the data ends (2025-03-20) before 30
+  # days have passed: window_end, not never_halved.
+  - name: fct_half_life_by_hand
+    model: fct_half_life
+    overrides:
+      vars: {data_end_hour: "2025-03-20 00:00:00", flat_profile_min_days: 3, flat_profile_max_amplitude: 0.3}
+    given:
+      - input: ref('int_spikes')
+        rows:
+          - {spike_id: "A|2025-03-01", page_title: A, spike_start: 2025-03-01, start_daily_views: 2000, baseline: 24.0, baseline_hourly: 1.0, qualifying_days: 1}
+          - {spike_id: "B|2025-02-01", page_title: B, spike_start: 2025-02-01, start_daily_views: 2000, baseline: 24.0, baseline_hourly: 1.0, qualifying_days: 1}
+          - {spike_id: "C|2025-03-10", page_title: C, spike_start: 2025-03-10, start_daily_views: 2000, baseline: 24.0, baseline_hourly: 1.0, qualifying_days: 1}
+      - input: ref('int_spike_hours')
+        format: sql
+        rows: |
+          select spike_id, page_title, hour_start, views, views = 0 as zero_filled from (values
+            ('A|2025-03-01', 'A', timestamp '2025-03-01 00:00:00.000', 5),
+            ('A|2025-03-01', 'A', timestamp '2025-03-01 01:00:00.000', 20),
+            ('A|2025-03-01', 'A', timestamp '2025-03-01 02:00:00.000', 60),
+            ('A|2025-03-01', 'A', timestamp '2025-03-01 03:00:00.000', 101),
+            ('A|2025-03-01', 'A', timestamp '2025-03-01 04:00:00.000', 80),
+            ('A|2025-03-01', 'A', timestamp '2025-03-01 05:00:00.000', 40),
+            ('A|2025-03-01', 'A', timestamp '2025-03-01 06:00:00.000', 60),
+            ('A|2025-03-01', 'A', timestamp '2025-03-01 07:00:00.000', 45),
+            ('A|2025-03-01', 'A', timestamp '2025-03-01 08:00:00.000', 30),
+            ('A|2025-03-01', 'A', timestamp '2025-03-01 09:00:00.000', 20),
+            ('A|2025-03-01', 'A', timestamp '2025-03-01 10:00:00.000', 0),
+            ('A|2025-03-01', 'A', timestamp '2025-03-01 11:00:00.000', 0),
+            ('B|2025-02-01', 'B', timestamp '2025-02-01 00:00:00.000', 101),
+            ('B|2025-02-01', 'B', timestamp '2025-02-01 01:00:00.000', 101),
+            ('B|2025-02-01', 'B', timestamp '2025-02-01 02:00:00.000', 101),
+            ('B|2025-02-01', 'B', timestamp '2025-02-01 03:00:00.000', 101),
+            ('C|2025-03-10', 'C', timestamp '2025-03-10 00:00:00.000', 101),
+            ('C|2025-03-10', 'C', timestamp '2025-03-10 01:00:00.000', 101),
+            ('C|2025-03-10', 'C', timestamp '2025-03-10 02:00:00.000', 101),
+            ('C|2025-03-10', 'C', timestamp '2025-03-10 03:00:00.000', 101)
+          ) as t(spike_id, page_title, hour_start, views)
+    expect:
+      rows:
+        - {spike_id: "A|2025-03-01", peak_views: 101, half_life_hours: 4, never_halved: false, window_end: false}
+        - {spike_id: "B|2025-02-01", peak_views: 101, half_life_hours: null, never_halved: true, window_end: false}
+        - {spike_id: "C|2025-03-10", peak_views: 101, half_life_hours: null, never_halved: false, window_end: true}

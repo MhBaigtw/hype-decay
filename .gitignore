@@ -33,3 +33,6 @@ data/
 # terraform plan files - can contain sensitive values
 tfplan*
 *.tfplan
+
+# dbt runs in its own Python 3.12 venv (transform/requirements.txt)
+.venv-dbt/
