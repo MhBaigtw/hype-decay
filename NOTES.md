@@ -326,3 +326,28 @@ About 197 GiB scanned in all, roughly $0.96.
 
 **Breaks at 10x:** a single-spike query already costs about $0.10, because its
 filter doesn't reach the table scans. Task 7's serving table must fix that.
+
+---
+
+## Task 7 — Serving table, API and public page (2026-10-08)
+
+**Built:** https://hype-decay.netlify.app. A loader writes `fct_half_life` into
+a DynamoDB table: 22,303 items, the largest 3.8 KB, loaded for $0.04. A Lambda
+behind an API Gateway HTTP API reads it, and the static page sits on Netlify.
+
+**Which service does what:** DynamoDB serves the spikes, Lambda shapes the JSON,
+API Gateway throttles and handles CORS, CloudWatch alarms on runaway traffic.
+
+**Decision:** precompute everything into DynamoDB. Rejected: querying Athena
+from the API, at about $0.10 per spike lookup. Netlify was the owner's choice
+of host, because CloudFront is not an allowed service.
+
+**Found:** the throttle is approximate. Set to 1 request/second, it let 7.4/s
+through under a flood, about $49 a month if sustained. An alarm now emails at
+20,000 requests an hour.
+
+**Cost:** about $0.009 per 1,000 page views; about $0.11 a month with zero
+traffic.
+
+**Breaks at 10x:** the loader rewrites every item, 64k write units, on each
+reload. A daily reload at 10x the spikes needs an incremental load.
