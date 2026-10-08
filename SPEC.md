@@ -146,11 +146,28 @@ missing data. The true value is 0 to 9, so an excess near zero is understated by
 at most 9 -- the reason SPEC already advises checking a half-life measured near
 the floor.
 
-**`burst`** — advisory, never a filter (CLAUDE.md): the peak hour's views are at
-least 10 times the largest hour within 2 hours either side of it. Catches the
-automated one-hour bursts misclassified as `user` traffic: `Schutzstaffel` took
-7,845,105 views in one hour on 2025-04-16 and 278 in its largest neighbouring
-hour. It replaces the `flat_profile` flag first specified here, which was
+**`burst`** — advisory, never a filter (CLAUDE.md). A spike is a burst when
+EITHER rule holds:
+
+- 10x rule: the peak hour's views are at least 10 times the largest hour within
+  2 hours either side of it. Catches one-hour automated bursts misclassified as
+  `user` traffic: `Schutzstaffel` took 7,845,105 views in one hour on 2025-04-16
+  and 278 in its largest neighbouring hour.
+- short-burst rule (`short_burst`), all three of: the 3 hours before the peak
+  each had fewer than 10 views (absent rows, 0 after zero-fill); the peak hour
+  plus the next hold at least 50% of the excess in the 24 hours from onset; and
+  the hour 2 after the peak is at most 10% of the peak hour. Catches the
+  two-hour automated bursts the 10x rule misses because their second hour is
+  about half the first: `Mary_Ajami` (2026-04-24) went 0, 0, 0, then 71,971,
+  34,643, then 2,345.
+
+The "silent before" condition is what separates an automated burst from real
+news on a new or obscure page. `Pope_Leo_XIV` was also silent before its peak --
+the page did not exist -- and also had half its first day in two hours, but two
+hours later it still drew 721,495 views, far above a tenth of its peak; a burst
+falls off a cliff, news does not. Measured limitation: a two-hour burst on a page
+that already had ordinary traffic beforehand is not silent, so it is not
+caught (README, known limitations). It replaces the `flat_profile` flag first specified here, which was
 dropped because it did the opposite of its job on real data: a steep decay
 flattens the hour-of-day profile, so it flagged the 2024 election itself
 (`Donald_Trump`, the election article, `Republican_Party_(United_States)`),
@@ -160,10 +177,22 @@ while a one-hour burst reads as extremely rhythmic, so it missed every burst.
 year (`<Month>_<YYYY>`). These list pages fill up over their month instead of
 decaying (`Deaths_in_September_2025`: 79.7% of its excess after day 7).
 
+**`rekindled`** — the peak day is the 24-hour block from onset (day 1 = the
+first 24 hours) with the most excess among days 1 to 3. A spike is rekindled
+when any later block in its 720-hour window, from day 4 on, has more excess
+than that peak day. The cause is the 30-day merge rule: a page that qualifies
+again within 30 days of a spike's start extends that spike instead of opening a
+new one, so a second, bigger event lands inside the first spike's window and its
+attention is counted as the first spike's tail. `Rory_McIlroy` spiked on
+2025-03-16 (74,975 views that day); his Masters win on 2025-04-13 drew 1,393,648
+inside the same window, and the spike's attention half-life came out at 698
+hours -- the Masters, not a slow fade. Flag only; a rekindled spike's metrics are
+kept but not ranked.
+
 **Leaderboard eligibility.** A spike appears on a leaderboard only when its peak
 day carries at least 20,000 views of excess over its baseline (`daily_views` on
-the peak's UTC day minus `baseline`), and it is neither a `burst` nor a
-`calendar_page`. Ineligible spikes stay in `fct_half_life`, flagged; the
+the peak's UTC day minus `baseline`), and it is not a `burst`, not `rekindled`,
+and not a `calendar_page`. Ineligible spikes stay in `fct_half_life`, flagged; the
 eligibility rule is for ranking, not for the data.
 
 ## Curated grain — two tiers

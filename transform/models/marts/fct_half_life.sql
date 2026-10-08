@@ -8,134 +8,134 @@
 -- 7.54M, 2.97M, 933k. Liam_Payne (2024-10-16) also scored 1 hour, yet his
 -- second day (3.70M) was bigger than the first (2.44M). The old figure is kept
 -- as peak_hour_half_life_hours, a diagnostic only.
-with spikes as (
-    select * from {{ ref('int_spikes') }}
-),
+--
+-- ONE SCAN of int_spike_hours (547M rows). Athena does not reuse a CTE that is
+-- referenced twice -- each reference is a fresh scan -- and with one CTE per
+-- measure this model read the table six times and tripped the dbt workgroup's
+-- 25 GiB per-query cap. So every per-spike measure is a window function over
+-- the single scan below, and the spike-level answer is one aggregation.
 
-hours as (
-    select * from {{ ref('int_spike_hours') }}
-),
-
-ranked_peak as (
-    -- peak_hour: the hour with the most views within 48h of spike start
-    -- (00:00 UTC of the first qualifying day); the earliest wins a tie.
-    select
-        h.spike_id, h.hour_start, h.views,
-        row_number() over (partition by h.spike_id
-                           order by h.views desc, h.hour_start asc) as rn
-    from hours h
-    join spikes s on s.spike_id = h.spike_id
-    where h.hour_start >= cast(s.spike_start as timestamp)
-      and h.hour_start <  cast(s.spike_start as timestamp) + interval '48' hour
-),
-
-peaks as (
-    select
-        p.spike_id,
-        s.page_title,
-        p.hour_start                              as peak_hour,
-        p.views                                   as peak_views,
-        p.views - s.baseline_hourly               as peak_excess,
-        s.baseline_hourly,
-        s.baseline
-    from ranked_peak p
-    join spikes s on s.spike_id = p.spike_id
-    where p.rn = 1
-),
-
-onsets as (
-    -- onset: the earliest hour within the 48 hours before the peak (the peak
-    -- included) whose excess reaches 10% of the peak hour's excess.
-    select p.spike_id, min(h.hour_start) as onset_hour
-    from peaks p
-    join hours h on h.spike_id = p.spike_id
-    where h.hour_start between p.peak_hour - interval '48' hour and p.peak_hour
-      and greatest(h.views - p.baseline_hourly, 0) >= 0.1 * p.peak_excess
-    group by p.spike_id
-),
-
-curve as (
-    -- excess(h) = views(h) - baseline_hourly, floored at 0, over the 720 hours
-    -- from onset (index 0 = the onset hour). Zero-filled hours are already 0
-    -- views in int_spike_hours, so they contribute nothing.
-    select
-        o.spike_id,
-        date_diff('hour', o.onset_hour, h.hour_start)             as idx,
-        greatest(h.views - p.baseline_hourly, 0)                  as excess
-    from onsets o
-    join peaks p on p.spike_id = o.spike_id
-    join hours h on h.spike_id = o.spike_id
-    where h.hour_start >= o.onset_hour
-      and h.hour_start <  o.onset_hour + interval '720' hour
-),
-
-running as (
-    select
-        spike_id, idx, excess,
-        sum(excess) over (partition by spike_id order by idx
-                          rows between unbounded preceding and current row) as cum,
-        sum(excess) over (partition by spike_id)                           as total
-    from curve
-),
-
-attention as (
-    -- attention_half_life_hours: hours from onset until the running total of
-    -- excess reaches 50% of the 720-hour total, counted to the END of the hour
-    -- in which it does (so all-in-the-first-hour is 1, not 0).
-    -- long_tail_share: the share of that total arriving after hour 168 (from
-    -- index 168 on: after the first 7 days).
-    select
-        spike_id,
-        max(total)                                                as total_excess_720h,
-        min(case when cum >= 0.5 * total then idx + 1 end)        as half_life_raw,
-        sum(case when idx >= 168 then excess else 0 end)
-          / nullif(max(total), 0)                                 as long_tail_raw
-    from running
-    group by spike_id
-),
-
-after_peak as (
-    -- DIAGNOSTIC ONLY: the original peak-hour half-life (first hour after the
-    -- peak at or under half the peak excess, and the next two too).
+with base as (
+    -- Every spine hour of every spike, with the spike's start and baseline.
     select
         h.spike_id,
         h.hour_start,
-        date_diff('hour', p.peak_hour, h.hour_start)                      as hours_after_peak,
-        greatest(h.views - p.baseline_hourly, 0) <= 0.5 * p.peak_excess   as below
-    from hours h
-    join peaks p on p.spike_id = h.spike_id
-    where h.hour_start > p.peak_hour
+        h.views,
+        s.spike_start,
+        s.baseline_hourly,
+        greatest(h.views - s.baseline_hourly, 0)                          as excess,
+        h.hour_start >= cast(s.spike_start as timestamp)
+          and h.hour_start < cast(s.spike_start as timestamp) + interval '48' hour
+                                                                          as in_peak_window
+    from {{ ref('int_spike_hours') }} h
+    join {{ ref('int_spikes') }} s on s.spike_id = h.spike_id
 ),
 
-peak_hour_half_life as (
-    select spike_id, min(hours_after_peak) as peak_hour_half_life_hours
-    from (
-        select spike_id, hours_after_peak,
-               below and lead(below, 1) over w and lead(below, 2) over w as settled
-        from after_peak
-        window w as (partition by spike_id order by hour_start)
-    ) x
-    where settled and hours_after_peak <= 720
+with_peak_views as (
+    -- peak_hour: the most views within 48h of spike start (00:00 UTC of the
+    -- first qualifying day); the earliest such hour wins a tie.
+    select *,
+        max(case when in_peak_window then views end) over (partition by spike_id) as peak_views
+    from base
+),
+
+with_peak as (
+    select *,
+        min(case when in_peak_window and views = peak_views then hour_start end)
+            over (partition by spike_id)                                  as peak_hour
+    from with_peak_views
+),
+
+with_onset as (
+    -- onset: the earliest hour within the 48 hours before the peak (the peak
+    -- included) whose excess reaches 10% of the peak hour's excess.
+    select *,
+        peak_views - baseline_hourly                                      as peak_excess,
+        min(case when hour_start between peak_hour - interval '48' hour and peak_hour
+                  and excess >= 0.1 * (peak_views - baseline_hourly)
+                 then hour_start end) over (partition by spike_id)        as onset_hour,
+        date_diff('hour', peak_hour, hour_start)                          as rp
+    from with_peak
+),
+
+measured as (
+    select *,
+        date_diff('hour', onset_hour, hour_start)                         as idx,
+        -- Running and total excess over the 720 hours from onset (idx 0-719).
+        sum(case when hour_start >= onset_hour and hour_start < onset_hour + interval '720' hour
+                 then excess else 0 end)
+            over (partition by spike_id order by hour_start
+                  rows between unbounded preceding and current row)       as cum,
+        sum(case when hour_start >= onset_hour and hour_start < onset_hour + interval '720' hour
+                 then excess else 0 end)
+            over (partition by spike_id)                                  as total,
+        -- Rekindled: excess per 24-hour block from onset (day 1 = idx 0-23).
+        sum(case when hour_start >= onset_hour and hour_start < onset_hour + interval '720' hour
+                 then excess else 0 end)
+            over (partition by spike_id,
+                  floor(date_diff('hour', onset_hour, hour_start) / 24.0))  as block_excess,
+        -- Diagnostic: the old peak-hour half-life's 3-hour debounce.
+        excess <= 0.5 * (peak_views - baseline_hourly)                    as below,
+        lead(excess <= 0.5 * (peak_views - baseline_hourly), 1)
+            over (partition by spike_id order by hour_start)              as below_1,
+        lead(excess <= 0.5 * (peak_views - baseline_hourly), 2)
+            over (partition by spike_id order by hour_start)              as below_2
+    from with_onset
+),
+
+per_spike as (
+    select
+        spike_id,
+        max(peak_hour)                                                    as peak_hour,
+        max(peak_views)                                                   as peak_views,
+        max(peak_excess)                                                  as peak_excess,
+        max(onset_hour)                                                   as onset_hour,
+        max(total)                                                        as total_excess_720h,
+        -- attention_half_life_hours: to the END of the hour in which the
+        -- running total first reaches half the 720-hour total.
+        min(case when idx between 0 and 719 and cum >= 0.5 * total then idx + 1 end)
+                                                                          as half_life_raw,
+        -- long_tail_share: excess after hour 168 (from idx 168 on).
+        sum(case when idx between 168 and 719 then excess else 0 end)
+          / nullif(max(total), 0)                                         as long_tail_raw,
+        min(case when rp between 1 and 720 and below and below_1 and below_2 then rp end)
+                                                                          as peak_hour_half_life_hours,
+        -- Burst, 10x rule: the largest hour within 2 hours either side.
+        coalesce(max(case when rp between -2 and 2 and rp != 0 then views end), 0)
+                                                                          as max_neighbour_views,
+        -- Short-burst inputs (missing rows are 0 after zero-fill).
+        coalesce(max(case when rp between -3 and -1 then views end), 0)   as max_views_3h_before,
+        coalesce(max(case when rp = 2 then views end), 0)                 as views_2h_after,
+        sum(case when rp in (0, 1) then excess else 0 end)                as excess_peak_2h,
+        sum(case when idx between 0 and 23 then excess else 0 end)        as excess_24h_from_onset,
+        -- Rekindled inputs: the best day among days 1-3, and among days 4-30.
+        max(case when idx between 0 and 71 then block_excess end)         as peak_block_excess,
+        max(case when idx between 72 and 719 then block_excess end)       as max_later_block_excess
+    from measured
     group by spike_id
 ),
 
-neighbours as (
-    -- Burst test: the largest hour within 2 hours either side of the peak.
-    select p.spike_id, max(h.views) as max_neighbour_views
-    from peaks p
-    join hours h on h.spike_id = p.spike_id
-    where h.hour_start between p.peak_hour - interval '2' hour and p.peak_hour + interval '2' hour
-      and h.hour_start != p.peak_hour
-    group by p.spike_id
+flagged as (
+    select
+        p.*,
+        p.peak_views >= 10 * p.max_neighbour_views                        as burst_10x,
+        -- Short burst (SPEC): out of silence -- the 3 hours before the peak
+        -- each under 10 views -- with the peak and the next hour holding half
+        -- the first day's excess, and the hour 2 after down to a tenth.
+        p.max_views_3h_before < 10
+          and p.excess_peak_2h >= 0.5 * p.excess_24h_from_onset
+          and p.views_2h_after <= 0.1 * p.peak_views                      as short_burst,
+        coalesce(p.max_later_block_excess > p.peak_block_excess, false)   as rekindled
+    from per_spike p
 ),
 
 peak_day as (
-    -- The peak's UTC day, from the daily grain (exact, not summed from hours,
-    -- which miss sub-10-view hours).
-    select p.spike_id, d.daily_views as peak_day_views
-    from peaks p
+    -- The peak's UTC day, from the daily grain (exact: hours miss sub-10s).
+    select f.spike_id, d.daily_views as peak_day_views
+    from flagged f
+    join {{ ref('int_spikes') }} s on s.spike_id = f.spike_id
     join {{ ref('int_page_daily') }} d
-      on d.page_title = p.page_title and d.dt = cast(p.peak_hour as date)
+      on d.page_title = s.page_title and d.dt = cast(f.peak_hour as date)
 )
 
 select
@@ -146,45 +146,45 @@ select
     s.baseline,
     s.baseline_hourly,
     s.qualifying_days,
-    p.peak_hour,
-    p.peak_views,
-    p.peak_excess,
-    o.onset_hour,
-    -- window_end censoring: the 720 hours from onset run past the data, so the
-    -- metric cannot be computed honestly. never_halved is retired: cumulative
-    -- excess always reaches 50% of its own total.
-    o.onset_hour + interval '719' hour > timestamp '{{ var("data_end_hour") }}'  as window_end,
-    case when o.onset_hour + interval '719' hour <= timestamp '{{ var("data_end_hour") }}'
-         then a.half_life_raw end                                 as attention_half_life_hours,
-    case when o.onset_hour + interval '719' hour <= timestamp '{{ var("data_end_hour") }}'
-         then a.long_tail_raw end                                 as long_tail_share,
-    a.total_excess_720h,
-    ph.peak_hour_half_life_hours,
+    f.peak_hour,
+    f.peak_views,
+    f.peak_excess,
+    f.onset_hour,
+    -- window_end censoring: the 720 hours from onset run past the data.
+    -- never_halved is retired: a running total always reaches half its total.
+    f.onset_hour + interval '719' hour > timestamp '{{ var("data_end_hour") }}'  as window_end,
+    case when f.onset_hour + interval '719' hour <= timestamp '{{ var("data_end_hour") }}'
+         then f.half_life_raw end                                         as attention_half_life_hours,
+    case when f.onset_hour + interval '719' hour <= timestamp '{{ var("data_end_hour") }}'
+         then f.long_tail_raw end                                         as long_tail_share,
+    f.total_excess_720h,
+    f.peak_hour_half_life_hours,
     pd.peak_day_views,
-    pd.peak_day_views - s.baseline                                as peak_day_excess,
-    coalesce(n.max_neighbour_views, 0)                            as max_neighbour_views,
-    -- burst: the peak hour is at least 10x the largest hour within 2 hours
-    -- either side. Advisory, never a filter (CLAUDE.md); it replaces the
-    -- flat-profile flag, which flagged the 2024 election and missed bursts.
-    p.peak_views >= 10 * coalesce(n.max_neighbour_views, 0)       as burst,
-    -- calendar list pages (Deaths_in_<Month>_<Year> and other month-and-year
-    -- lists) fill up over their month instead of decaying.
+    pd.peak_day_views - s.baseline                                        as peak_day_excess,
+    f.max_neighbour_views,
+    -- burst: advisory, never a filter (CLAUDE.md). Replaces flat_profile.
+    f.burst_10x or f.short_burst                                          as burst,
+    f.short_burst,
+    -- rekindled: a later day in the window out-drew the peak day (SPEC).
+    f.rekindled,
+    f.peak_block_excess,
+    f.max_later_block_excess,
+    -- calendar list pages (Deaths_in_<Month>_<Year>, month-and-year lists)
+    -- fill up over their month instead of decaying.
     regexp_like(s.page_title, '^Deaths_in_')
       or regexp_like(s.page_title,
            '(January|February|March|April|May|June|July|August|September|October|November|December)_[0-9]{4}')
-                                                                  as calendar_page,
-    -- Leaderboard eligibility: a peak day with 20,000+ views of excess, not a
-    -- burst, not a calendar page.
-    (pd.peak_day_views - s.baseline) >= {{ var("leaderboard_min_peak_day_excess") }}
-      and not (p.peak_views >= 10 * coalesce(n.max_neighbour_views, 0))
-      and not (regexp_like(s.page_title, '^Deaths_in_')
-               or regexp_like(s.page_title,
-                    '(January|February|March|April|May|June|July|August|September|October|November|December)_[0-9]{4}'))
-                                                                  as leaderboard_eligible
-from spikes s
-join peaks p on p.spike_id = s.spike_id
-join onsets o on o.spike_id = s.spike_id
-left join attention a on a.spike_id = s.spike_id
-left join peak_hour_half_life ph on ph.spike_id = s.spike_id
-left join neighbours n on n.spike_id = s.spike_id
+                                                                          as calendar_page,
+    -- Leaderboard eligibility: 20,000+ views of excess on the peak day, and
+    -- not a burst, not rekindled, not a calendar page.
+    coalesce(
+      (pd.peak_day_views - s.baseline) >= {{ var("leaderboard_min_peak_day_excess") }}
+        and not (f.burst_10x or f.short_burst)
+        and not f.rekindled
+        and not (regexp_like(s.page_title, '^Deaths_in_')
+                 or regexp_like(s.page_title,
+                      '(January|February|March|April|May|June|July|August|September|October|November|December)_[0-9]{4}')),
+      false)                                                              as leaderboard_eligible
+from {{ ref('int_spikes') }} s
+join flagged f on f.spike_id = s.spike_id
 left join peak_day pd on pd.spike_id = s.spike_id
