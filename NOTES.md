@@ -256,9 +256,10 @@ fixtures. Curated zone 52.83 GiB: page_hour 35.84, page_daily 16.99.
 **Cost:** 14.42 instance-hours across every launch. $2.82 of October usage plus
 $0.37 tax; no credits applied yet.
 
-**Decision:** incremental compaction, peaking at 4,882 MiB. Rejected: the
-all-at-once engine, which peaked at 7,393 MiB on 2025-08-28 and killed run 1.
-The outputs are identical.
+**Decision:** incremental compaction (run peak 4,882 MiB). Rejected: the
+all-at-once engine that killed run 1. Same-day comparison on 2025-08-28 with
+`ingest/compare_engines.py`: old engine 7,393 MiB, incremental 4,071 MiB,
+identical output (10,656,921 rows, 221,084,480 views).
 
 **Breaks at 10x:** one box and three connections. Ten times the window is about
 90 h, and a day with 10x the pages would exhaust memory even incrementally.
