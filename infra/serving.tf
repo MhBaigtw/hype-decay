@@ -212,7 +212,100 @@ resource "aws_cloudwatch_metric_alarm" "api_runaway" {
   threshold           = 20000
   comparison_operator = "GreaterThanThreshold"
   treat_missing_data  = "notBreaching"
-  alarm_actions       = ["arn:aws:sns:${var.region}:${data.aws_caller_identity.current.account_id}:${var.project}-alerts"]
-  ok_actions          = ["arn:aws:sns:${var.region}:${data.aws_caller_identity.current.account_id}:${var.project}-alerts"]
-  tags                = { Task = "task-7-serving" }
+  # Email, AND trip the kill switch (an alarm Lambda action).
+  alarm_actions = [
+    "arn:aws:sns:${var.region}:${data.aws_caller_identity.current.account_id}:${var.project}-alerts",
+    aws_lambda_function.killswitch.arn,
+  ]
+  ok_actions = ["arn:aws:sns:${var.region}:${data.aws_caller_identity.current.account_id}:${var.project}-alerts"]
+  tags       = { Task = "task-7-serving" }
+}
+
+# --- automatic kill switch -------------------------------------------------
+#
+# When the runaway alarm fires it invokes this Lambda directly (an alarm Lambda
+# action). It sets the API Lambda's reserved concurrency to 0 -- every API
+# request is then refused, and nothing behind it runs or bills -- and emails
+# what it did and the one-command restore (api/killswitch.py):
+#
+#   aws lambda delete-function-concurrency --function-name hype-decay-api --profile hype-decay-deploy
+#
+# A `terraform plan` while it is tripped shows reserved_concurrent_executions
+# 0 -> -1 on aws_lambda_function.api: applying that restores it too.
+
+data "archive_file" "killswitch" {
+  type        = "zip"
+  source_file = "${path.module}/../api/killswitch.py"
+  output_path = "${path.module}/.build/killswitch.zip"
+}
+
+resource "aws_iam_role" "killswitch" {
+  name               = "${var.project}-api-killswitch"
+  description        = "May switch the public API Lambda off, and say so. Nothing else."
+  assume_role_policy = data.aws_iam_policy_document.api_assume.json
+  tags               = { Task = "task-6-daily" }
+}
+
+data "aws_iam_policy_document" "killswitch" {
+  statement {
+    sid       = "SwitchOffTheApiOnly"
+    effect    = "Allow"
+    actions   = ["lambda:PutFunctionConcurrency"]
+    resources = [aws_lambda_function.api.arn]
+  }
+  statement {
+    sid       = "SayWhatItDid"
+    effect    = "Allow"
+    actions   = ["sns:Publish"]
+    resources = ["arn:aws:sns:${var.region}:${data.aws_caller_identity.current.account_id}:${var.project}-alerts"]
+  }
+  statement {
+    sid       = "OwnLogs"
+    effect    = "Allow"
+    actions   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+    resources = ["arn:aws:logs:${var.region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${var.project}-api-killswitch:*"]
+  }
+}
+
+resource "aws_iam_role_policy" "killswitch" {
+  name   = "${var.project}-api-killswitch"
+  role   = aws_iam_role.killswitch.id
+  policy = data.aws_iam_policy_document.killswitch.json
+}
+
+resource "aws_cloudwatch_log_group" "killswitch" {
+  name              = "/aws/lambda/${var.project}-api-killswitch"
+  retention_in_days = 90 # rare events; keep the record longer
+  tags              = { Task = "task-6-daily" }
+}
+
+resource "aws_lambda_function" "killswitch" {
+  function_name    = "${var.project}-api-killswitch"
+  role             = aws_iam_role.killswitch.arn
+  runtime          = "python3.12"
+  architectures    = ["arm64"]
+  handler          = "killswitch.handler"
+  filename         = data.archive_file.killswitch.output_path
+  source_code_hash = data.archive_file.killswitch.output_base64sha256
+  memory_size      = 128
+  timeout          = 10
+  tags             = { Task = "task-6-daily" }
+
+  environment {
+    variables = {
+      API_FUNCTION    = aws_lambda_function.api.function_name
+      ALERT_TOPIC_ARN = "arn:aws:sns:${var.region}:${data.aws_caller_identity.current.account_id}:${var.project}-alerts"
+      ALARM_NAME      = "${var.project}-api-runaway-traffic"
+    }
+  }
+
+  depends_on = [aws_cloudwatch_log_group.killswitch]
+}
+
+resource "aws_lambda_permission" "killswitch" {
+  statement_id  = "AllowRunawayAlarm"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.killswitch.function_name
+  principal     = "lambda.alarms.cloudwatch.amazonaws.com"
+  source_arn    = aws_cloudwatch_metric_alarm.api_runaway.arn
 }
