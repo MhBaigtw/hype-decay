@@ -91,25 +91,51 @@ cannot have a complete baseline and are not evaluated for spikes.
 
 **`excess(h)`** — `views(h) - baseline_hourly`, floored at 0.
 
-**`half_life_hours`** — hours from `peak_hour` to the first hour where
-`excess(h) <= 0.5 * peak_excess` AND it stays at or below that level for 3
-consecutive hours. The 3-hour debounce prevents a single quiet hour from
-ending the measurement early.
+**The primary metric is the ATTENTION half-life (Task 5 revision).** It replaces
+the peak-hour half-life this spec first defined, which turned out to measure the
+wrong thing on real data. Measured against the single busiest hour, a
+breaking-news spike "halves" within an hour while attention stays high for days:
 
-**censoring** — if no such hour exists within 30 days of `peak_hour`, set
-`half_life_hours = NULL` and `is_censored = true`. Report the censored rate
-prominently. Some spikes genuinely never decay because the event permanently
-changed how often the page is read, and hiding that is dishonest.
+- `Pope_Leo_XIV`, 2025-05-08: 3,858,371 views in the announcement hour, 1,253,701
+  the next, so a peak-hour half-life of 1 hour -- while the days ran 7.54M,
+  2.97M, 933k.
+- `Liam_Payne`, 2024-10-16: 1,506,740 views in the news-break hour, 491,147 the
+  next, peak-hour half-life 1 hour -- yet the SECOND day (3.70M) was bigger than
+  the first (2.44M).
 
-Censoring is TWO flags, reported separately (Task 5), because they mean
-opposite things:
+Across all spikes that definition gave a median of 3 hours whatever the spike's
+size, and almost nothing censored: it was timing the news-break hour, not the
+decay of attention. The new definitions:
 
-- `never_halved` -- all 30 days after the peak were observed and the excess
-  never fell to half. A real finding about the page.
-- `window_end` -- the data ends before 30 days after the peak, so it may yet
-  halve. An artefact of where the data stops, nothing about the page.
+**`onset`** — the earliest hour within the 48 hours before `peak_hour` (the peak
+included) whose `excess(h)` reaches 10% of `peak_excess`.
 
-The 40% stop rule (TASKS, Task 5) applies to `never_halved` only.
+**`attention_half_life_hours`** — hours from `onset` until the running total of
+`excess(h)` -- zero-filled, floored at 0 -- reaches 50% of the total excess over
+the 720 hours from `onset`. Counted to the END of the hour in which it does, so a
+spike with half its excess in its first hour scores 1, not 0.
+
+**`long_tail_share`** — the share of that 720-hour excess arriving after hour
+168 (from the 169th hour on: after the first 7 days).
+
+**censoring** — `window_end` only: if `onset + 720 hours` runs past the last
+hour of data, the 720-hour total cannot be known, so the spike is censored and
+both metrics are NULL. Report the censored rate. `never_halved` is RETIRED: a
+running total always reaches half of its own total, so "never halved" cannot
+occur under this definition; a page whose attention permanently rose instead
+shows a high `long_tail_share`.
+
+**`peak_hour_half_life_hours`** is kept as a DIAGNOSTIC column only -- the old
+definition (first hour after the peak at or under half `peak_excess` for 3
+consecutive hours) -- so the README can show why it was replaced.
+
+A known property, not a defect: for an ANTICIPATED event the clock starts at the
+build-up. `Kamala_Harris` (spike 2024-11-05) had a pre-election baseline of 90k
+views a day, so the final campaign hours already cleared 10% of the peak excess:
+onset 2024-11-04 14:00, 39 hours before the peak, and an attention half-life of
+43 hours, longer than `Donald_Trump`'s 28 even though her post-election daily
+drop was steeper. Her `long_tail_share` is 0.2% because within a week her views
+fell below that campaign-inflated baseline, and excess is floored at 0.
 
 **Hourly zero-fill.** The half-life is measured over an hour spine for each
 spike, from 48 hours before its peak to 30 days after (plus the 2 hours the
@@ -120,14 +146,25 @@ missing data. The true value is 0 to 9, so an excess near zero is understated by
 at most 9 -- the reason SPEC already advises checking a half-life measured near
 the floor.
 
-**`flat_profile`** -- advisory, never a filter (CLAUDE.md). Human attention has
-a daily rhythm; crawlers do not. For each UTC day from the peak's day through 6
-days after, with 240+ views (10 an hour on average), each hour's share of the
-day; averaged per hour of day; `diurnal_amplitude` = (max - min) of those 24
-mean shares, relative to a flat 1/24. A spike is flagged when it has at least
-`flat_profile_min_days` such days and its amplitude is below
-`flat_profile_max_amplitude` (dbt vars, calibrated in Task 5: NOTES). A spike
-without enough active days is not flagged either way.
+**`burst`** — advisory, never a filter (CLAUDE.md): the peak hour's views are at
+least 10 times the largest hour within 2 hours either side of it. Catches the
+automated one-hour bursts misclassified as `user` traffic: `Schutzstaffel` took
+7,845,105 views in one hour on 2025-04-16 and 278 in its largest neighbouring
+hour. It replaces the `flat_profile` flag first specified here, which was
+dropped because it did the opposite of its job on real data: a steep decay
+flattens the hour-of-day profile, so it flagged the 2024 election itself
+(`Donald_Trump`, the election article, `Republican_Party_(United_States)`),
+while a one-hour burst reads as extremely rhythmic, so it missed every burst.
+
+**`calendar_page`** — titles starting `Deaths_in_`, or containing a month and a
+year (`<Month>_<YYYY>`). These list pages fill up over their month instead of
+decaying (`Deaths_in_September_2025`: 79.7% of its excess after day 7).
+
+**Leaderboard eligibility.** A spike appears on a leaderboard only when its peak
+day carries at least 20,000 views of excess over its baseline (`daily_views` on
+the peak's UTC day minus `baseline`), and it is neither a `burst` nor a
+`calendar_page`. Ineligible spikes stay in `fct_half_life`, flagged; the
+eligibility rule is for ranking, not for the data.
 
 ## Curated grain — two tiers
 

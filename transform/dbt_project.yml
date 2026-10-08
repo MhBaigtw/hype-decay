@@ -19,11 +19,9 @@ vars:
   # Baseline = 28 days ending 2 days before. The first 30 days have no full
   # window, so spikes are evaluated from window_start + 30 days.
   evaluation_offset_days: 30
-  # Flat-profile flag (fct_half_life): a spike is flagged when, over at least
-  # this many active days from its peak, the hour-of-day profile's amplitude is
-  # under this. Calibrated against the data; see NOTES, Task 5.
-  flat_profile_min_days: 3
-  flat_profile_max_amplitude: 0.3
+  # Leaderboards count only spikes whose peak day carries this much excess over
+  # baseline, and that are neither bursts nor calendar pages (fct_half_life).
+  leaderboard_min_peak_day_excess: 20000
 
 models:
   hype_decay:

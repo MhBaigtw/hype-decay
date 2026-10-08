@@ -82,22 +82,33 @@ models:
         data_tests: [not_null, non_negative]
 
   - name: fct_half_life
-    description: One row per spike with peak, half-life, both censoring flags and the flat-profile flag.
+    description: One row per spike. Primary metric attention_half_life_hours (cumulative excess from onset); peak_hour_half_life_hours is a diagnostic only.
     columns:
       - name: spike_id
         data_tests: [unique, not_null]
       - name: peak_hour
         data_tests: [not_null]
+      - name: onset_hour
+        data_tests: [not_null]
       - name: peak_views
         data_tests: [not_null, non_negative]
-      - name: half_life_hours
+      - name: attention_half_life_hours
         data_tests:
-          - non_negative
           - accepted_range_nullable:
               arguments:
                 min_value: 1
                 max_value: 720
-      - name: never_halved
-        data_tests: [not_null]
+      - name: long_tail_share
+        data_tests:
+          - accepted_range_nullable:
+              arguments:
+                min_value: 0
+                max_value: 1
       - name: window_end
+        data_tests: [not_null]
+      - name: burst
+        data_tests: [not_null]
+      - name: calendar_page
+        data_tests: [not_null]
+      - name: leaderboard_eligible
         data_tests: [not_null]
