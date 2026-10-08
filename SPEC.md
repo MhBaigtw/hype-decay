@@ -290,6 +290,21 @@ Athena writes these files without min/max statistics on `page_title`, so a page
 lookup cannot skip row groups by title; the saving comes from the sorted column
 being small, not from skipping. Partitioning by `dt` is what prunes.
 
+**`page_daily` cannot skip data on a title filter, and is not rewritten to.**
+Measured on 2025-03-14 (NOTES, Task 4): each day is 5 files of one row group
+each; the writer records no min/max for text columns; Iceberg's per-file title
+bounds exist but every file spans nearly the whole alphabet, because Athena's
+parallel writers each sort their own slice of rows. And because a title occurs
+once a day, `page_title` overflows Parquet's dictionary and is stored PLAIN:
+14.4 MiB a day. So any query filtered on `page_title` reads that whole column for
+every day in its `dt` range -- about 10.3 GiB for the full history, more than
+the 5 GiB interactive cap. `page_hour`, where titles repeat and stay
+dictionary-encoded, reads about 3x less per day for the same lookup.
+Consequences, decided: models read `page_daily` in whole-table passes against
+the candidate-pages table, never page by page; and single-page lookups for the
+public page come from a small serving table built in Task 7, not from either
+curated table.
+
 **Once Iceberg owns a table, nothing writes or deletes files behind it.** New
 days are written THROUGH Iceberg -- an Athena `INSERT` from the staging prefix,
 once a day is compacted -- never by putting a file under `curated/iceberg/`. A

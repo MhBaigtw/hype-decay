@@ -52,6 +52,14 @@ against the Wikimedia Pageviews REST API matched **15 of 15 exactly**, including
 
 ## Known limitations
 
+**Looking up one page in `page_daily` reads the whole day, every day.** The
+title column cannot be skipped: Athena writes no text statistics, and its
+parallel writers leave every file spanning the whole alphabet. A one-page,
+one-day lookup reads 14.4 MiB, and one page across the full two years about
+10.3 GiB, more than the interactive scan cap allows. The models therefore read
+`page_daily` in whole-table passes, and single-page lookups for the public page
+will come from a small serving table (Task 7).
+
 These are properties of the data, not bugs to be fixed later. Both affect how the
 numbers should be read.
 
