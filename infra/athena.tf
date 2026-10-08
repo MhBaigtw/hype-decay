@@ -35,17 +35,54 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "athena_results" {
 resource "aws_s3_bucket_lifecycle_configuration" "athena_results" {
   bucket = aws_s3_bucket.athena_results.id
 
+  # Query results are reproducible by re-running the query, so keeping them is
+  # pure cost: they expire. dbt's TABLES must not, and they live in this bucket
+  # too -- the dbt workgroup enforces its output location, so dbt-athena ignores
+  # s3_data_dir and writes table data under dbt-results/tables/. A single
+  # bucket-wide expiry (the rule this replaces) would have deleted every model's
+  # data 7 days after each build, and the tables would have read empty.
+  #
+  # S3 lifecycle filters match prefixes, so "dbt-results/ except tables/" is
+  # expressed by what Athena names things: every query result is
+  # <query-id>.csv[.metadata], and a query id is a UUID, so those keys begin
+  # with a hex digit. dbt-results/tables/ begins with "t", which no rule below
+  # matches. Checked against the bucket on 2026-10-08: every top-level object
+  # under dbt-results/ started with 0-9 or a-f, and every table object with "t".
   rule {
     id     = "expire-query-results"
     status = "Enabled"
 
-    filter {}
+    filter {
+      prefix = "query-results/"
+    }
 
-    # Query results are reproducible by re-running the query, so keeping them
-    # is pure cost.
     expiration {
       days = var.athena_results_retention_days
     }
+  }
+
+  dynamic "rule" {
+    for_each = toset(split("", "0123456789abcdef"))
+
+    content {
+      id     = "expire-dbt-query-results-${rule.value}"
+      status = "Enabled"
+
+      filter {
+        prefix = "dbt-results/${rule.value}"
+      }
+
+      expiration {
+        days = var.athena_results_retention_days
+      }
+    }
+  }
+
+  rule {
+    id     = "abort-incomplete-uploads"
+    status = "Enabled"
+
+    filter {}
 
     abort_incomplete_multipart_upload {
       days_after_initiation = 1
