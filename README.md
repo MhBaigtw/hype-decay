@@ -1,18 +1,20 @@
 # hype-decay
 
+**Live: https://hype-decay.netlify.app**
+
 Measuring how long the internet stays interested in something.
 
-When a topic spikes in public attention, how many hours until that attention
-falls to half its peak? Some spikes are gone in a day. Some never fully fade.
+When a topic suddenly spikes on English Wikipedia, how long until half of all the
+extra attention it will get that month has arrived? That is the **attention
+half-life**: measured on the running total of views above the page's usual level,
+from the moment the surge begins. For the typical big spike it is about a day.
+Some are half over within the hour; some keep drawing readers for weeks.
 
 Built on AWS. See `SPEC.md` for metric definitions, `TASKS.md` for build
 order, `CLAUDE.md` for constraints, `HANDOFF.md` for the Claude Code kickoff
 prompt and review loop.
 
 ## Status
-
-**Live: https://hype-decay.netlify.app** -- search a topic and see how fast its
-attention faded.
 
 Tasks 0 to 5 and 7 complete: account guardrails, Terraform backend, ingestion,
 the two-year backfill (17,520 of 17,520 hours, 0 failed), the curated zone as
@@ -162,9 +164,11 @@ caveat. The residual problem is traffic Wikimedia MISCLASSIFIES as `user`. Worke
 example: `.xyz` took 24,025 views in a single hour on 2026-09-10 and survives the
 namespace exclusions, while the REST API splits that day as 121k `user` against
 262k `automated`. Inside our data the user-classified share is indistinguishable
-from a human reader, so spikes on obscure titles deserve suspicion. A flag for
-spikes whose hourly profile is suspiciously flat is planned, since human attention
-has a diurnal shape and crawlers do not.
+from a human reader, so spikes on obscure titles deserve suspicion. A `burst`
+flag catches the clearest cases -- one or two enormous hours out of silence, then
+a cliff -- and keeps them off the leaderboards. A flag for suspiciously FLAT hourly
+profiles was tried and dropped: a steep decay flattens a page's daily rhythm, so
+it flagged the 2024 election itself and missed every burst (SPEC, `burst`).
 
 **Counts are per requested title, not per resolved article.** The source records
 the title as requested, so a redirect and its target are counted separately:

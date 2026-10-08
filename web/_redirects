@@ -1,0 +1,4 @@
+# The page reads its summary from Netlify, not the API: Netlify proxies this
+# path to the API once and keeps it in its edge cache for a day
+# (Netlify-CDN-Cache-Control on the response), so page views stop reaching AWS.
+/summary.json  https://9pz7pkqzn9.execute-api.us-east-1.amazonaws.com/api/summary  200!

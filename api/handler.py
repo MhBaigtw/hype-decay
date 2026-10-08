@@ -87,15 +87,18 @@ def plain(value):
     return value
 
 
-def respond(status, payload, max_age=0):
-    return {
-        "statusCode": status,
-        "headers": {"content-type": "application/json",
-                    # The data changes at most once a day (Task 6), so browsers
-                    # may cache it; that is page views that never reach AWS.
-                    "cache-control": f"public, max-age={max_age}" if max_age else "no-store"},
-        "body": json.dumps(plain(payload), separators=(",", ":")),
-    }
+def respond(status, payload, max_age=0, cdn_max_age=0):
+    headers = {"content-type": "application/json",
+               # The data changes at most once a day (Task 6), so browsers may
+               # cache it; that is page views that never reach AWS.
+               "cache-control": f"public, max-age={max_age}" if max_age else "no-store"}
+    if cdn_max_age:
+        # For Netlify's edge, which proxies /summary.json to this endpoint
+        # (web/_redirects): cache it for the day, so the API is asked a few
+        # times a day rather than once per page view.
+        headers["netlify-cdn-cache-control"] = f"public, durable, s-maxage={cdn_max_age}"
+    return {"statusCode": status, "headers": headers,
+            "body": json.dumps(plain(payload), separators=(",", ":"))}
 
 
 def summary():
@@ -109,7 +112,8 @@ def summary():
         return respond(503, {"error": "serving table not loaded"})
     return respond(200, {"stats": by_pk["STATS"],
                          "fastest": by_pk.get("LEADERBOARD#fastest", []),
-                         "slowest": by_pk.get("LEADERBOARD#slowest", [])}, max_age=3600)
+                         "slowest": by_pk.get("LEADERBOARD#slowest", [])},
+                   max_age=3600, cdn_max_age=86400)
 
 
 def search(q):

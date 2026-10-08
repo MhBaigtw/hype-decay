@@ -15,33 +15,35 @@ never could:
 It also asserts the hostile-input handling stays honest: malformed rows, bad
 integers and undecodable titles are counted, not silently absorbed.
 
-    python3 test_parser_regression.py                       # fetch the fixture from S3
+    python3 test_parser_regression.py                       # fetch the hour from Wikimedia
     python3 test_parser_regression.py --fixture local.gz    # use a local copy
+
+The fixture hour is fetched from the canonical dumps.wikimedia.org URL, once,
+on one connection, with the project User-Agent. It used to come from an S3
+copy, which the raw-tier lifecycle rule expired; the public file does not.
 
 Exit 0 means the parser still agrees with the external reference.
 """
 
 import argparse
 import gzip
-import os
 import sys
 import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ingest_hour import (  # noqa: E402
+    CANONICAL_BASE,
     PAGE_HOUR_MIN_VIEWS,
     REGRESSION_EXPECTED,
     REGRESSION_HOUR,
     build_tiers,
+    build_url,
+    download,
     hour_start_of,
     parse,
     parse_source_hour,
 )
-
-DEFAULT_BUCKET = "hype-decay-curated-820697996849"
-FIXTURE_KEY = ("fixtures/raw_48h/dt=2026-09-10/hour=17/"
-               "pageviews-20260910-180000.gz")
 
 # Rows the real file does not contain, appended to a copy to prove the hostile
 # paths are exercised rather than merely present.
@@ -65,18 +67,19 @@ def check(label, got, expected):
     return ok
 
 
-def fetch_fixture(bucket, dest):
-    import boto3
-    session = boto3.Session(profile_name=os.environ.get("AWS_PROFILE"))
-    print(f"  fetching s3://{bucket}/{FIXTURE_KEY}")
-    session.client("s3").download_file(bucket, FIXTURE_KEY, str(dest))
+def fetch_fixture(dest):
+    url = build_url(CANONICAL_BASE, parse_source_hour(REGRESSION_HOUR))
+    print(f"  fetching {url}")
+    written, _, declared = download(url, dest)
+    if declared and written != declared:
+        raise SystemExit(f"short download: {written:,} of {declared:,} bytes")
     return dest
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
-    ap.add_argument("--fixture", default="", help="local .gz instead of the S3 fixture")
-    ap.add_argument("--bucket", default=DEFAULT_BUCKET)
+    ap.add_argument("--fixture", default="",
+                    help="local .gz instead of fetching the hour from Wikimedia")
     args = ap.parse_args()
 
     print("=" * 70)
@@ -86,7 +89,7 @@ def main():
     workdir = Path(tempfile.mkdtemp(prefix="hype-decay-test-"))
     try:
         fixture = Path(args.fixture) if args.fixture else fetch_fixture(
-            args.bucket, workdir / "fixture.gz")
+            workdir / "fixture.gz")
 
         source_hour = parse_source_hour(REGRESSION_HOUR)
         hour_start = hour_start_of(source_hour)
@@ -118,7 +121,7 @@ def main():
         passed.append(check("en.m mobile views", stats["views_en_m"], 5_966_626))
 
         print()
-        print("  hostile input handling, on a copy with 4 bad rows appended:")
+        print(f"  hostile input handling, on a copy with {len(HOSTILE_ROWS)} bad rows appended:")
         hostile = workdir / "hostile.gz"
         with gzip.open(fixture, "rb") as src, gzip.open(hostile, "wb") as out:
             out.write(src.read())

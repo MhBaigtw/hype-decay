@@ -101,6 +101,8 @@ class HandlerTest(unittest.TestCase):
         self.assertEqual(b["stats"]["median_hours"], 27)
         self.assertEqual(b["fastest"][0]["page_title"], "Liam_Payne")
         self.assertIn("slowest", b)
+        r = handler.handler(event("/api/summary"), None)
+        self.assertIn("s-maxage=86400", r["headers"]["netlify-cdn-cache-control"])
 
     def test_unknown_route_is_404(self):
         self.assertEqual(handler.handler(event("/api/other"), None)["statusCode"], 404)

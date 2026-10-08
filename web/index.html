@@ -449,7 +449,10 @@ function drawTable(d) {
 }
 
 window.addEventListener("resize", () => current && drawChart(current));
-get("/api/summary").then(renderSummary).catch((e) => {
+// The summary is served by Netlify from its edge cache (/summary.json, see
+// _redirects), so a page view does not reach the API for it.
+fetch("/summary.json").then((r) => { if (!r.ok) throw new Error(r.status); return r.json(); })
+  .then(renderSummary).catch((e) => {
   $("hero-text").innerHTML = `<span class="error">Could not load the figures (${e.message}).</span>`;
 });
 loadSpike(DEFAULT_SPIKE);
