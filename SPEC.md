@@ -307,7 +307,10 @@ s3://<bucket>/curated/iceberg/page_daily/    Iceberg, partitioned by dt, sorted 
 s3://<bucket>/curated/page_daily/dt=.../part-<source hour>.parquet   ingest staging: hourly partial
 s3://<bucket>/curated/page_daily/dt=.../day.parquet                  ingest staging: compacted day
 s3://<bucket>/curated/page_hour/dt=/hour=/  ingest staging: plain Parquet, one file per hour
-s3://<bucket>/marts/                        dbt outputs
+s3://<bucket>/marts/                        dbt outputs (in practice under the Athena results
+                                            bucket's dbt-results/tables/: the enforced workgroup
+                                            location wins; never expired, Task 5)
+dynamodb:hype-decay-serving                 the public page's data, loaded from fct_half_life (Task 7)
 s3://<bucket>/fixtures/raw_48h/*.gz         48 hours of source gz, fixture only
 ```
 

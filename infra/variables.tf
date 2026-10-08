@@ -141,3 +141,21 @@ variable "athena_results_retention_days" {
   type        = number
   default     = 7
 }
+
+variable "site_origins" {
+  description = "Origins allowed to call the public API from a browser (CORS): the Netlify site, and nothing else."
+  type        = list(string)
+  default     = ["https://hype-decay.netlify.app"]
+}
+
+variable "api_rate_limit" {
+  description = "Steady-state requests per second for the whole public API. 1 rps serves ~40k page views a day; sustained by a crawler for a month it bounds the bill near $7 (NOTES, Task 7)."
+  type        = number
+  default     = 1
+}
+
+variable "api_burst_limit" {
+  description = "Burst ceiling for the whole public API."
+  type        = number
+  default     = 10
+}

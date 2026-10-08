@@ -1,0 +1,458 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How long does the internet care?</title>
+<meta name="description" content="When a topic suddenly spikes on English Wikipedia, how long until half of the extra attention has come and gone? Two years of hourly pageviews, measured.">
+<style>
+  :root {
+    color-scheme: light;
+    --surface-0: #f4f3ef;
+    --surface-1: #fcfcfb;
+    --text-primary: #0b0b0b;
+    --text-secondary: #52514e;
+    --muted: #898781;
+    --grid: #e1e0d9;
+    --series-1: #2a78d6;
+    --series-1-soft: rgba(42, 120, 214, 0.28);
+    --marker: #0b0b0b;
+    --border: #e1e0d9;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --surface-0: #121211;
+      --surface-1: #1a1a19;
+      --text-primary: #ffffff;
+      --text-secondary: #c3c2b7;
+      --muted: #898781;
+      --grid: #2c2c2a;
+      --series-1: #3987e5;
+      --series-1-soft: rgba(57, 135, 229, 0.32);
+      --marker: #ffffff;
+      --border: #2c2c2a;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --surface-0: #121211; --surface-1: #1a1a19; --text-primary: #ffffff;
+    --text-secondary: #c3c2b7; --muted: #898781; --grid: #2c2c2a; --series-1: #3987e5;
+    --series-1-soft: rgba(57, 135, 229, 0.32); --marker: #ffffff; --border: #2c2c2a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--surface-0); color: var(--text-primary);
+    font: 16px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 860px; margin: 0 auto; padding: 32px 16px 64px; }
+  h1 { font-size: 2rem; line-height: 1.2; margin: 0 0 8px; letter-spacing: -0.01em; }
+  h2 { font-size: 1.25rem; margin: 40px 0 8px; }
+  h3 { font-size: 1rem; margin: 20px 0 4px; }
+  p { margin: 0 0 12px; }
+  .lede { color: var(--text-secondary); font-size: 1.05rem; }
+  .card {
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px;
+    padding: 20px; margin-top: 16px;
+  }
+  .hero { display: flex; gap: 24px; flex-wrap: wrap; align-items: baseline; }
+  .hero-number { font-size: 3.5rem; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; }
+  .hero-text { flex: 1 1 320px; }
+  .small { font-size: 0.875rem; color: var(--text-secondary); }
+  .muted { color: var(--muted); }
+  label { font-weight: 600; display: block; margin-bottom: 6px; }
+  input[type=search] {
+    width: 100%; font: inherit; padding: 10px 12px; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--surface-1); color: var(--text-primary);
+  }
+  ul.results { list-style: none; padding: 0; margin: 8px 0 0; }
+  ul.results li button, table button {
+    font: inherit; background: none; border: none; color: var(--series-1); cursor: pointer;
+    padding: 6px 0; text-align: left; text-decoration: underline; text-underline-offset: 2px;
+  }
+  .result-meta { color: var(--text-secondary); font-size: 0.875rem; margin-left: 6px; }
+  .chart-head { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; align-items: baseline; }
+  .chart-title { font-size: 1.15rem; font-weight: 700; margin: 0; overflow-wrap: anywhere; }
+  .toggle { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .toggle button {
+    font: inherit; font-size: 0.875rem; padding: 4px 10px; border: none; cursor: pointer;
+    background: var(--surface-1); color: var(--text-secondary);
+  }
+  .toggle button[aria-pressed=true] { background: var(--series-1); color: #fff; }
+  .chart-wrap { position: relative; margin-top: 12px; }
+  svg.chart { width: 100%; height: auto; display: block; touch-action: none; }
+  .tooltip {
+    position: absolute; pointer-events: none; background: var(--surface-1); color: var(--text-primary);
+    border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; font-size: 0.8125rem;
+    box-shadow: 0 2px 8px rgba(0,0,0,.12); white-space: nowrap; display: none;
+  }
+  .verdict { font-size: 1.05rem; margin: 12px 0 0; }
+  .legend { display: flex; gap: 16px; flex-wrap: wrap; font-size: 0.8125rem; color: var(--text-secondary); margin-top: 6px; }
+  .swatch { display: inline-block; width: 12px; height: 12px; border-radius: 3px; vertical-align: -1px; margin-right: 6px; }
+  .boards { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(300px, 100%), 1fr)); gap: 16px; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.9375rem; }
+  th, td { text-align: left; padding: 6px 4px; border-bottom: 1px solid var(--border); vertical-align: top; overflow-wrap: anywhere; }
+  td.num, th.num, td.date { white-space: nowrap; overflow-wrap: normal; }
+  ul.results li button, table button { overflow-wrap: anywhere; }
+  th { font-size: 0.8125rem; color: var(--text-secondary); font-weight: 600; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  td button { padding: 0; }
+  details summary { cursor: pointer; color: var(--text-secondary); font-size: 0.875rem; margin-top: 10px; }
+  .flags dt { font-weight: 700; margin-top: 10px; }
+  .flags dd { margin: 0 0 0 0; color: var(--text-secondary); }
+  footer { margin-top: 48px; font-size: 0.8125rem; color: var(--muted); }
+  .error { color: #e34948; }
+</style>
+</head>
+<body>
+<main>
+  <h1>How long does the internet care?</h1>
+  <p class="lede">When something suddenly becomes news, people rush to read about it on Wikipedia.
+    We measured how quickly that rush fades, for every big spike in two years of English Wikipedia
+    page views.</p>
+
+  <section class="card" aria-labelledby="finding">
+    <h2 id="finding" style="margin-top:0">The finding</h2>
+    <div class="hero">
+      <div class="hero-number" id="hero-number">&ndash;</div>
+      <div class="hero-text">
+        <p id="hero-text">Loading&hellip;</p>
+        <p class="small" id="hero-detail"></p>
+      </div>
+    </div>
+  </section>
+
+  <section aria-labelledby="explore">
+    <h2 id="explore">Look up a topic</h2>
+    <div class="card">
+      <label for="q">Wikipedia page title</label>
+      <input id="q" type="search" placeholder="e.g. Pope Leo, Liam Payne, Taylor Swift" autocomplete="off"
+             aria-describedby="q-help">
+      <p class="small" id="q-help" style="margin-top:6px">Matches the start of the title. Only spikes big enough to
+        rank are included (see how this was measured, below).</p>
+      <ul class="results" id="results" aria-live="polite"></ul>
+    </div>
+
+    <div class="card" id="curve-card" aria-live="polite">
+      <div class="chart-head">
+        <p class="chart-title" id="chart-title">&nbsp;</p>
+        <div class="toggle" role="group" aria-label="Time range">
+          <button type="button" id="range-week" aria-pressed="true">First week</button>
+          <button type="button" id="range-month" aria-pressed="false">30 days</button>
+        </div>
+      </div>
+      <p class="verdict" id="verdict"></p>
+      <div class="chart-wrap" id="chart-wrap">
+        <svg class="chart" id="chart" role="img" aria-labelledby="chart-title verdict"></svg>
+        <div class="tooltip" id="tooltip" role="status"></div>
+      </div>
+      <div class="legend" aria-hidden="true">
+        <span><span class="swatch" style="background:var(--series-1)"></span>Extra views per hour, before the halfway point</span>
+        <span><span class="swatch" style="background:var(--series-1-soft)"></span>&hellip;after it</span>
+      </div>
+      <details>
+        <summary>Show the numbers, day by day</summary>
+        <table id="day-table"><thead><tr><th>Day</th><th class="num">Extra views</th><th class="num">Share of the month</th><th class="num">Running total</th></tr></thead><tbody></tbody></table>
+      </details>
+    </div>
+  </section>
+
+  <section aria-labelledby="boards">
+    <h2 id="boards">Fastest forgotten, longest remembered</h2>
+    <p class="small">Among the biggest spikes (at least 20,000 extra views on their busiest day), by attention half-life.
+      Click a title to see its curve.</p>
+    <div class="boards">
+      <div class="card">
+        <h3 style="margin-top:0">Gone fastest</h3>
+        <table id="fastest"><thead><tr><th>Page</th><th>Date</th><th class="num">Half-life</th></tr></thead><tbody></tbody></table>
+      </div>
+      <div class="card">
+        <h3 style="margin-top:0">Lingered longest</h3>
+        <table id="slowest"><thead><tr><th>Page</th><th>Date</th><th class="num">Half-life</th></tr></thead><tbody></tbody></table>
+      </div>
+    </div>
+  </section>
+
+  <section aria-labelledby="method">
+    <h2 id="method">How this was measured</h2>
+    <div class="card">
+      <h3 style="margin-top:0">What counts as a spike</h3>
+      <p>We read every hour of English Wikipedia page views from September 2024 to September 2026
+        (desktop and mobile, human readers only, as Wikimedia classifies them). A page <em>spikes</em> on a day
+        when it gets at least 1,000 views, at least 500 more than usual, and at least five times its usual daily
+        views. "Usual" is the page's median day over the four weeks before.</p>
+
+      <h3>What "half-life" means here</h3>
+      <p id="method-halflife">For each spike we add up all the <em>extra</em> views &mdash; above the page's usual level &mdash;
+        over the 30 days after the surge began. The <strong>attention half-life</strong> is how many hours it took for
+        half of that month's extra attention to arrive. A short half-life means the world looked, then moved on.
+        A long one means people kept coming back.</p>
+
+      <h3>The measure we threw away</h3>
+      <p>Our first definition was the obvious one: how long until hourly views drop to half of the busiest hour.
+        It passed every automated test &mdash; and gave answers that were plainly wrong.</p>
+      <table id="examples"><thead><tr><th>Event</th><th class="num">Busiest-hour measure</th><th class="num">Attention half-life</th></tr></thead><tbody></tbody></table>
+      <p class="small" style="margin-top:8px">The moment news breaks, one hour towers over everything after it, so the busiest-hour
+        measure only timed that single hour. Liam Payne's page got more views on the day <em>after</em> his death than on the
+        day itself, yet the busiest-hour measure said attention halved within an hour.</p>
+
+      <h3>Spikes we flag and leave out of the rankings</h3>
+      <dl class="flags">
+        <dt>Bursts</dt>
+        <dd>Some traffic is automated even though Wikimedia counts it as human. It looks like a cliff: millions of views
+          in one or two hours, out of nowhere, then nothing. ("Schutzstaffel" got 7.8 million views in one hour, then 278.)
+          Real news fades; it doesn't fall off a cliff.</dd>
+        <dt>Rekindled</dt>
+        <dd>A spike whose page drew an even bigger crowd later in the same month &mdash; usually a second event, like a
+          golfer's spike in March followed by winning the Masters in April. Its "decay" would really be measuring the
+          second event.</dd>
+        <dt>Calendar pages</dt>
+        <dd>Pages like "Deaths in September 2025" fill up over their month instead of fading.</dd>
+      </dl>
+      <p class="small" id="flag-counts"></p>
+
+      <h3>Limits worth knowing</h3>
+      <p class="small">Counts are per page <em>title</em>: views of a redirect (an alternative title) are counted separately.
+        Some automated bursts still get through when the page had a little traffic beforehand. Spikes too close to the end
+        of the data (September 2026) are not given a half-life, since their month isn't over.
+        For events people saw coming, the clock starts with the build-up, which makes them look slower.</p>
+    </div>
+  </section>
+
+  <footer>
+    Data: Wikimedia hourly pageviews (CC0). Built on AWS: S3, Iceberg, Athena, dbt, DynamoDB, Lambda.
+    <span id="loaded-at"></span>
+  </footer>
+</main>
+
+<script>
+const API = "https://9pz7pkqzn9.execute-api.us-east-1.amazonaws.com";
+const DEFAULT_SPIKE = "Pope_Leo_XIV|2025-05-08";
+
+const $ = (id) => document.getElementById(id);
+const fmt = (n) => Math.round(n).toLocaleString("en-US");
+const compact = (n) => n >= 1e6 ? (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + "M"
+                    : n >= 1e3 ? (n / 1e3).toFixed(n >= 1e4 ? 0 : 1) + "k" : String(Math.round(n));
+const title = (t) => t.replace(/_/g, " ");
+const hoursInWords = (h) => h == null ? "not yet known"
+  : h < 48 ? `${h} hour${h === 1 ? "" : "s"}`
+  : `${h} hours (about ${(h / 24).toFixed(h < 240 ? 1 : 0)} days)`;
+
+async function get(path) {
+  const r = await fetch(API + path);
+  if (!r.ok) throw new Error(`${r.status}`);
+  return r.json();
+}
+
+// --- the finding ------------------------------------------------------------
+function renderSummary(d) {
+  const s = d.stats, hl = s.attention_half_life, all = s.attention_half_life_including_rekindled;
+  $("hero-number").textContent = `${hl.median} hours`;
+  $("hero-text").innerHTML =
+    `When a topic suddenly spikes on Wikipedia, <strong>half of all the extra attention it will get over the
+     next month has usually arrived within about a day</strong> &mdash; ${hl.median} hours, for the typical
+     spike among the ${fmt(s.qualifying_spikes)} biggest.`;
+  $("hero-detail").innerHTML =
+    `A quarter of these spikes are half over within ${hl.q1} hours; a quarter take ${hl.q3} hours or more.
+     The typical spike still gets ${Math.round(s.long_tail_share.median * 100)}% of its extra attention after its
+     first week. These figures leave out ${fmt(s.rekindled_among_big)} big spikes that were "rekindled" by a later,
+     bigger event (${Math.round(100 * s.rekindled_among_big / s.big_spikes)}% of them; explained below); counting them,
+     the typical half-life is ${all.median} hours.`;
+  $("flag-counts").textContent =
+    `Of ${fmt(s.spikes_detected)} spikes detected: ${fmt(s.burst)} flagged as bursts, ${fmt(s.rekindled)} as rekindled, `
+    + `${fmt(s.calendar_page)} as calendar pages, and ${fmt(s.window_end)} too close to the end of the data to measure. `
+    + `Flagged spikes stay in the data; they are only left out of the rankings.`;
+  const ex = $("examples").querySelector("tbody");
+  ex.innerHTML = "";
+  for (const id of ["Pope_Leo_XIV", "Liam_Payne", "Donald_Trump"]) {
+    const e = s.examples[id];
+    if (!e) continue;
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${title(e.page_title)} <span class="muted">${e.spike_start}</span></td>
+      <td class="num">${e.peak_hour_half_life_hours} h</td><td class="num">${e.attention_half_life_hours} h</td>`;
+    ex.appendChild(tr);
+  }
+  for (const [board, rows] of [["fastest", d.fastest], ["slowest", d.slowest]]) {
+    const tb = $(board).querySelector("tbody");
+    tb.innerHTML = "";
+    for (const r of rows.slice(0, 10)) {
+      const tr = document.createElement("tr");
+      const b = document.createElement("button");
+      b.type = "button"; b.textContent = title(r.page_title);
+      b.addEventListener("click", () => { loadSpike(r.spike_id); $("curve-card").scrollIntoView({ behavior: "smooth" }); });
+      const td = document.createElement("td"); td.appendChild(b); tr.appendChild(td);
+      tr.insertAdjacentHTML("beforeend",
+        `<td class="muted date">${r.spike_start}</td><td class="num">${hoursInWords(r.attention_half_life_hours).replace(/ \(about.*\)/, "")}</td>`);
+      tb.appendChild(tr);
+    }
+  }
+  $("loaded-at").textContent = `Figures computed ${s.loaded_at.slice(0, 10)}.`;
+}
+
+// --- search -----------------------------------------------------------------
+let searchTimer = null, searchSeq = 0;
+$("q").addEventListener("input", () => {
+  clearTimeout(searchTimer);
+  const q = $("q").value.trim();
+  if (q.length < 2) { $("results").innerHTML = ""; return; }
+  searchTimer = setTimeout(async () => {
+    const seq = ++searchSeq;
+    try {
+      const d = await get(`/api/search?q=${encodeURIComponent(q)}`);
+      if (seq !== searchSeq) return;
+      const ul = $("results");
+      ul.innerHTML = "";
+      if (!d.results.length) { ul.innerHTML = `<li class="small">No ranked spike starts with "${q.replace(/</g, "&lt;")}".</li>`; return; }
+      for (const r of d.results) {
+        const li = document.createElement("li");
+        const b = document.createElement("button");
+        b.type = "button"; b.textContent = title(r.page_title);
+        b.addEventListener("click", () => loadSpike(r.spike_id));
+        li.appendChild(b);
+        li.insertAdjacentHTML("beforeend", `<span class="result-meta">${r.spike_start} &middot; `
+          + (r.window_end ? "still unfolding when the data ends" : `half-life ${hoursInWords(r.attention_half_life_hours)}`)
+          + `</span>`);
+        ul.appendChild(li);
+      }
+    } catch (e) { $("results").innerHTML = `<li class="error">Search failed (${e.message}).</li>`; }
+  }, 250);
+});
+
+// --- the decay curve ----------------------------------------------------------
+let current = null, rangeHours = 168;
+
+function setRange(h) {
+  rangeHours = h;
+  $("range-week").setAttribute("aria-pressed", h === 168);
+  $("range-month").setAttribute("aria-pressed", h === 720);
+  if (current) drawChart(current);
+}
+$("range-week").addEventListener("click", () => setRange(168));
+$("range-month").addEventListener("click", () => setRange(720));
+
+async function loadSpike(id) {
+  try {
+    const d = await get(`/api/spike?id=${encodeURIComponent(id)}`);
+    current = d;
+    const hl = d.attention_half_life_hours;
+    $("chart-title").textContent = `${title(d.page_title)} — spike of ${d.spike_start}`;
+    const surge = new Date(d.onset_hour.replace(" ", "T") + "Z");
+    const when = surge.toUTCString().replace(/:\d\d GMT$/, " UTC");
+    if (d.window_end) {
+      $("verdict").textContent = `The surge began ${when}. The data ends before its 30 days are up, so its half-life isn't known yet.`;
+    } else {
+      $("verdict").innerHTML = `The surge began ${when}. <strong>Half of the month's extra attention had arrived within
+        ${hoursInWords(hl)}.</strong> ${Math.round(d.long_tail_share * 100)}% of it came after the first week.`;
+    }
+    setRange(hl != null && hl > 96 ? 720 : 168);
+    drawTable(d);
+  } catch (e) {
+    $("verdict").innerHTML = `<span class="error">Could not load that spike (${e.message}).</span>`;
+  }
+}
+
+function niceMax(v) {
+  if (v <= 0) return 1;
+  const p = Math.pow(10, Math.floor(Math.log10(v)));
+  for (const m of [1, 2, 2.5, 5, 10]) if (m * p >= v) return m * p;
+  return 10 * p;
+}
+
+function drawChart(d) {
+  const svg = $("chart");
+  // Drawn at the container's real width, so text stays 12px on a phone
+  // instead of being scaled down with a fixed 800px drawing.
+  const W = Math.max(300, Math.round($("chart-wrap").clientWidth || 800));
+  const H = W < 520 ? 240 : 320, L = W < 520 ? 44 : 56, R = 12, T = 16, B = 40;
+  const n = Math.min(rangeHours, d.excess.length);
+  const ex = d.excess.slice(0, n);
+  const yMax = niceMax(Math.max(...ex, 1));
+  const x = (i) => L + (i / Math.max(rangeHours - 1, 1)) * (W - L - R);
+  const y = (v) => T + (1 - v / yMax) * (H - T - B);
+  const hl = d.attention_half_life_hours;
+  const split = hl != null ? Math.min(hl, n) : n;     // hours [0, split) arrived before the halfway point
+
+  const area = (from, to) => {
+    if (to <= from) return "";
+    let p = `M${x(from)},${y(0)}`;
+    for (let i = from; i < to; i++) p += `L${x(i)},${y(ex[i])}`;
+    return p + `L${x(to - 1)},${y(0)}Z`;
+  };
+  let s = "";
+  // gridlines + y labels
+  // Five even steps of a "nice" maximum (1, 2, 2.5 or 5 x 10^n), so ticks land
+  // on round numbers: 5M -> 1M steps, never 1.25M shown as "1.3M".
+  for (let k = 0; k <= 5; k++) {
+    const v = (yMax / 5) * k, yy = y(v);
+    s += `<line x1="${L}" x2="${W - R}" y1="${yy}" y2="${yy}" stroke="var(--grid)" stroke-width="1"/>`;
+    s += `<text x="${L - 8}" y="${yy + 4}" text-anchor="end" font-size="12" fill="var(--muted)">${compact(v)}</text>`;
+  }
+  // x labels: days
+  const step = rangeHours === 168 ? (W < 520 ? 48 : 24) : (W < 520 ? 240 : 120);
+  for (let h = 0; h <= rangeHours; h += step) {
+    const xx = L + (h / Math.max(rangeHours - 1, 1)) * (W - L - R);
+    if (xx > W - R + 1) break;
+    s += `<text x="${xx}" y="${H - B + 18}" text-anchor="middle" font-size="12" fill="var(--muted)">day ${h / 24}</text>`;
+  }
+  s += `<text x="${(L + W - R) / 2}" y="${H - 4}" text-anchor="middle" font-size="12" fill="var(--text-secondary)">time since the surge began</text>`;
+  // The rotated axis title collides with the tick labels on a phone; there the
+  // legend below the chart names the measure instead.
+  if (W >= 520) s += `<text x="12" y="${T + (H - T - B) / 2}" text-anchor="middle" font-size="12" fill="var(--text-secondary)" transform="rotate(-90 12 ${T + (H - T - B) / 2})">extra views per hour</text>`;
+  // the two halves of the month's attention, one hue
+  s += `<path d="${area(split, n)}" fill="var(--series-1-soft)"/>`;
+  s += `<path d="${area(0, split)}" fill="var(--series-1)"/>`;
+  // halfway marker
+  if (hl != null && hl <= n) {
+    const hx = x(hl);
+    s += `<line x1="${hx}" x2="${hx}" y1="${T}" y2="${H - B}" stroke="var(--marker)" stroke-width="2" stroke-dasharray="4 3"/>`;
+    const anchorEnd = hx > W * 0.7;
+    s += `<text x="${hx + (anchorEnd ? -8 : 8)}" y="${T + 14}" text-anchor="${anchorEnd ? "end" : "start"}" font-size="13" font-weight="600" fill="var(--text-primary)">${W < 520 ? "halfway" : "half the month's attention"}: ${hl} h</text>`;
+  }
+  s += `<line id="crosshair" x1="0" x2="0" y1="${T}" y2="${H - B}" stroke="var(--muted)" stroke-width="1" visibility="hidden"/>`;
+  s += `<rect id="hit" x="${L}" y="${T}" width="${W - L - R}" height="${H - T - B}" fill="transparent"/>`;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.innerHTML = s;
+
+  const tip = $("tooltip"), cross = svg.querySelector("#crosshair"), hit = svg.querySelector("#hit");
+  const move = (evt) => {
+    const pt = svg.createSVGPoint(); pt.x = evt.clientX; pt.y = evt.clientY;
+    const loc = pt.matrixTransform(svg.getScreenCTM().inverse());
+    const i = Math.max(0, Math.min(n - 1, Math.round(((loc.x - L) / (W - L - R)) * (rangeHours - 1))));
+    const cx = x(i);
+    cross.setAttribute("x1", cx); cross.setAttribute("x2", cx); cross.setAttribute("visibility", "visible");
+    const day = Math.floor(i / 24) + 1, hr = i % 24;
+    tip.innerHTML = `Hour ${i} (day ${day}, +${hr}h)<br><strong>${fmt(ex[i])}</strong> extra views`
+      + (hl != null ? `<br>${i < hl ? "before" : "after"} the halfway point` : "");
+    const rect = $("chart-wrap").getBoundingClientRect();
+    const px = (cx / W) * rect.width;
+    tip.style.display = "block";
+    tip.style.left = Math.min(Math.max(px + 12, 0), rect.width - tip.offsetWidth) + "px";
+    tip.style.top = "8px";
+  };
+  hit.addEventListener("pointermove", move);
+  hit.addEventListener("pointerdown", move);
+  hit.addEventListener("pointerleave", () => { tip.style.display = "none"; cross.setAttribute("visibility", "hidden"); });
+}
+
+function drawTable(d) {
+  const tb = $("day-table").querySelector("tbody");
+  tb.innerHTML = "";
+  const total = d.excess.reduce((a, b) => a + b, 0) || 1;
+  let run = 0;
+  for (let day = 0; day * 24 < d.excess.length; day++) {
+    const v = d.excess.slice(day * 24, day * 24 + 24).reduce((a, b) => a + b, 0);
+    run += v;
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>Day ${day + 1}</td><td class="num">${fmt(v)}</td><td class="num">${(100 * v / total).toFixed(1)}%</td><td class="num">${(100 * run / total).toFixed(1)}%</td>`;
+    tb.appendChild(tr);
+  }
+}
+
+window.addEventListener("resize", () => current && drawChart(current));
+get("/api/summary").then(renderSummary).catch((e) => {
+  $("hero-text").innerHTML = `<span class="error">Could not load the figures (${e.message}).</span>`;
+});
+loadSpike(DEFAULT_SPIKE);
+</script>
+</body>
+</html>

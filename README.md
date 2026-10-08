@@ -11,10 +11,33 @@ prompt and review loop.
 
 ## Status
 
-Tasks 0 to 5 complete: account guardrails, Terraform backend, ingestion, the
-two-year backfill (17,520 of 17,520 hours, 0 failed), the curated zone as two
-Iceberg tables in the Glue Data Catalog, and the dbt models that detect spikes
-and measure how fast attention fades. Task 6, the hourly incremental, is next.
+**Live: https://hype-decay.netlify.app** -- search a topic and see how fast its
+attention faded.
+
+Tasks 0 to 5 and 7 complete: account guardrails, Terraform backend, ingestion,
+the two-year backfill (17,520 of 17,520 hours, 0 failed), the curated zone as
+two Iceberg tables in the Glue Data Catalog, the dbt models that detect spikes
+and measure how fast attention fades, and the public page with its API. Task 6,
+the daily incremental, is next.
+
+## Serving the page, and what it costs
+
+The page never queries Athena: a one-spike Athena query costs about $0.10. A
+script precomputes everything into a DynamoDB table -- one item per qualifying
+spike with its 720-hour curve (zlib-compressed, 1.0 KB on average), plus the
+headline stats and both leaderboards: 22,303 items, the largest 3.8 KB against
+DynamoDB's 400 KB limit, loaded for $0.04. A Lambda behind an API Gateway HTTP
+API reads it; the page itself is static, on Netlify.
+
+| | Cost |
+|---|---|
+| per 1,000 page views | about **$0.009** (a typical view makes 2 API calls, an engaged one 5) |
+| standing, with zero traffic | about **$0.11 a month** (table storage and one alarm) |
+| worst case, a crawler at the throttle for a month | about $49 -- an alarm emails within the hour |
+
+The throttle (1 request/second, burst 10) is enforced approximately by API
+Gateway: under a measured 30-second flood it let 7.4 requests/second through and
+rejected the rest. That is why the alarm exists.
 
 ## How fast attention fades
 

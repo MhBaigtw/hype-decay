@@ -201,6 +201,11 @@ intervention and no duplicate rows.
 
 ## Task 7 — API and frontend
 
+**Status: done, 2026-10-08.** Live at https://hype-decay.netlify.app. DynamoDB
+serving table (22,303 items) behind a Lambda and an HTTP API, throttled, with
+a runaway-traffic alarm; the page never queries Athena. Cost per 1,000 page
+views about $0.009; standing cost about $0.11 a month. See NOTES, Task 7.
+
 - Lambda behind an API Gateway HTTP API. Two endpoints: search a page, return
   its decay curve; and return the leaderboards.
 - Results cached, because every uncached call is an Athena scan that costs

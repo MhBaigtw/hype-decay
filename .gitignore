@@ -39,3 +39,9 @@ tfplan*
 transform/.user.yml
 transform/target/
 transform/logs/
+
+# Terraform-built Lambda zips
+infra/.build/
+
+# Netlify CLI local state
+.netlify/
