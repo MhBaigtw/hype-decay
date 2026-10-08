@@ -1,0 +1,11 @@
+version: 2
+
+sources:
+  - name: curated
+    description: Iceberg tables built in Task 4. Partitioned by dt; every query filters on it.
+    schema: hype_decay
+    tables:
+      - name: page_hour
+        description: One row per (page, hour) where hourly views >= 10. Every one of the 17,520 source hours is present, so an absent page-hour means fewer than 10 views.
+      - name: page_daily
+        description: One row per (page, day) where daily views >= 10, the floor applied at compaction.

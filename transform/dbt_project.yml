@@ -1,0 +1,42 @@
+name: hype_decay
+version: "1.0.0"
+config-version: 2
+profile: hype_decay
+
+model-paths: ["models"]
+seed-paths: ["seeds"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]
+
+vars:
+  # The backfill window, by hour_start day (SPEC; ingest/backfill.py).
+  window_start: "2024-09-13"
+  window_end: "2026-09-12"
+  # The last hour of data: hour_start of source file 2026-09-13T00.
+  data_end_hour: "2026-09-12 23:00:00"
+  # Baseline = 28 days ending 2 days before. The first 30 days have no full
+  # window, so spikes are evaluated from window_start + 30 days.
+  evaluation_offset_days: 30
+  # Leaderboards count only spikes whose peak day carries this much excess over
+  # baseline, and that are neither bursts nor calendar pages (fct_half_life).
+  leaderboard_min_peak_day_excess: 20000
+
+models:
+  hype_decay:
+    +schema: dbt
+    staging:
+      +materialized: view
+    intermediate:
+      +materialized: table
+    marts:
+      +materialized: table
+
+seeds:
+  hype_decay:
+    +schema: dbt
+    complete_days:
+      +column_types:
+        dt: date
+        hours_done: integer

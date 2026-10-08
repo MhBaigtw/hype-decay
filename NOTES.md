@@ -300,3 +300,29 @@ Proven on 2025-03-15: identical result, no other day touched.
 
 **Breaks at 10x:** `page_daily` lookups read the whole title column, 14.4 MiB
 a day, with nothing to skip. Ten times the pages exceeds the dbt cap.
+
+---
+
+## Task 5 — dbt models: spikes and attention half-life (2026-10-08)
+
+**Built:** dbt-athena models from staging to `fct_half_life`, with 5 unit tests
+and 41 data tests. Glue holds the model tables; Athena runs them in the capped
+dbt workgroup.
+
+**The story, in order.** The peak-hour half-life passed every test, then failed
+the sanity check. `Pope_Leo_XIV` and `Liam_Payne` both scored 1 hour, yet
+Payne's second day was bigger than his first. It was timing the news-break hour,
+so it was replaced by the attention half-life: cumulative excess from onset.
+That exposed two leaderboard artifacts. Two-hour automated bursts slipped past
+the burst rule, and the 30-day merge folded second events into first spikes
+(`Rory_McIlroy`'s Masters). Both are now flagged, not dropped.
+
+**Decisions:** a 24-hour rolling average was rejected because it smears any
+decay faster than a day to about a day. `flat_profile` was dropped because it
+flagged the 2024 election and missed every burst.
+
+**Result:** 22,300 qualifying spikes, median attention half-life 27 hours.
+About 197 GiB scanned in all, roughly $0.96.
+
+**Breaks at 10x:** a single-spike query already costs about $0.10, because its
+filter doesn't reach the table scans. Task 7's serving table must fix that.

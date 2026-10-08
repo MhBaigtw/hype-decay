@@ -151,6 +151,13 @@ README.
 
 ## Task 5 — dbt models
 
+**Status: done, 2026-10-08.** `dbt build` clean: 5 unit tests and 41 data
+tests pass. The half-life SPEC first defined (peak-hour) was replaced by the
+attention half-life after it failed the sanity check; burst, rekindled and
+calendar flags added. 22,300 qualifying spikes, median attention half-life
+27 h. `window_end` censoring 4.08%, far under the 40% stop rule
+(`never_halved` retired). See NOTES, Task 5, and the README.
+
 `dbt-athena`. Layered: staging, intermediate, marts.
 
 - `stg_page_hour` — cleaned base grain

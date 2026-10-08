@@ -75,21 +75,125 @@ registering as a spike. A page can only open one spike per 30-day window;
 if it qualifies again inside that window, extend the existing spike rather
 than opening a new one.
 
+The 30-day window is anchored at the spike's START day (Task 5): a page that
+qualifies again fewer than 30 days after the start extends that spike; 30 or
+more days after the start, it opens a new one. Anchoring at the most recent
+qualifying day instead would let a page that qualifies every few weeks chain one
+spike indefinitely. A spike's start is 00:00 UTC of its first qualifying day.
+
+**Evaluation starts 30 days into the window.** The baseline needs 28 days ending
+2 days before, so the first 30 days of the window (2024-09-13 to 2024-10-12)
+cannot have a complete baseline and are not evaluated for spikes.
+
 **`peak_hour`** — the hour with maximum `views` within 48 hours of spike start.
 
 **`peak_excess`** — `views(peak_hour) - baseline_hourly`.
 
 **`excess(h)`** — `views(h) - baseline_hourly`, floored at 0.
 
-**`half_life_hours`** — hours from `peak_hour` to the first hour where
-`excess(h) <= 0.5 * peak_excess` AND it stays at or below that level for 3
-consecutive hours. The 3-hour debounce prevents a single quiet hour from
-ending the measurement early.
+**The primary metric is the ATTENTION half-life (Task 5 revision).** It replaces
+the peak-hour half-life this spec first defined, which turned out to measure the
+wrong thing on real data. Measured against the single busiest hour, a
+breaking-news spike "halves" within an hour while attention stays high for days:
 
-**censoring** — if no such hour exists within 30 days of `peak_hour`, set
-`half_life_hours = NULL` and `is_censored = true`. Report the censored rate
-prominently. Some spikes genuinely never decay because the event permanently
-changed how often the page is read, and hiding that is dishonest.
+- `Pope_Leo_XIV`, 2025-05-08: 3,858,371 views in the announcement hour, 1,253,701
+  the next, so a peak-hour half-life of 1 hour -- while the days ran 7.54M,
+  2.97M, 933k.
+- `Liam_Payne`, 2024-10-16: 1,506,740 views in the news-break hour, 491,147 the
+  next, peak-hour half-life 1 hour -- yet the SECOND day (3.70M) was bigger than
+  the first (2.44M).
+
+Across all spikes that definition gave a median of 3 hours whatever the spike's
+size, and almost nothing censored: it was timing the news-break hour, not the
+decay of attention. The new definitions:
+
+**`onset`** — the earliest hour within the 48 hours before `peak_hour` (the peak
+included) whose `excess(h)` reaches 10% of `peak_excess`.
+
+**`attention_half_life_hours`** — hours from `onset` until the running total of
+`excess(h)` -- zero-filled, floored at 0 -- reaches 50% of the total excess over
+the 720 hours from `onset`. Counted to the END of the hour in which it does, so a
+spike with half its excess in its first hour scores 1, not 0.
+
+**`long_tail_share`** — the share of that 720-hour excess arriving after hour
+168 (from the 169th hour on: after the first 7 days).
+
+**censoring** — `window_end` only: if `onset + 720 hours` runs past the last
+hour of data, the 720-hour total cannot be known, so the spike is censored and
+both metrics are NULL. Report the censored rate. `never_halved` is RETIRED: a
+running total always reaches half of its own total, so "never halved" cannot
+occur under this definition; a page whose attention permanently rose instead
+shows a high `long_tail_share`.
+
+**`peak_hour_half_life_hours`** is kept as a DIAGNOSTIC column only -- the old
+definition (first hour after the peak at or under half `peak_excess` for 3
+consecutive hours) -- so the README can show why it was replaced.
+
+A known property, not a defect: for an ANTICIPATED event the clock starts at the
+build-up. `Kamala_Harris` (spike 2024-11-05) had a pre-election baseline of 90k
+views a day, so the final campaign hours already cleared 10% of the peak excess:
+onset 2024-11-04 14:00, 39 hours before the peak, and an attention half-life of
+43 hours, longer than `Donald_Trump`'s 28 even though her post-election daily
+drop was steeper. Her `long_tail_share` is 0.2% because within a week her views
+fell below that campaign-inflated baseline, and excess is floored at 0.
+
+**Hourly zero-fill.** The half-life is measured over an hour spine for each
+spike, from 48 hours before its peak to 30 days after (plus the 2 hours the
+debounce needs), capped at the last hour of data. A spine hour with no
+`page_hour` row is 0. That is sound because all 17,520 source hours are present
+(Task 3, verified): a missing page-hour therefore means fewer than 10 views, not
+missing data. The true value is 0 to 9, so an excess near zero is understated by
+at most 9 -- the reason SPEC already advises checking a half-life measured near
+the floor.
+
+**`burst`** — advisory, never a filter (CLAUDE.md). A spike is a burst when
+EITHER rule holds:
+
+- 10x rule: the peak hour's views are at least 10 times the largest hour within
+  2 hours either side of it. Catches one-hour automated bursts misclassified as
+  `user` traffic: `Schutzstaffel` took 7,845,105 views in one hour on 2025-04-16
+  and 278 in its largest neighbouring hour.
+- short-burst rule (`short_burst`), all three of: the 3 hours before the peak
+  each had fewer than 10 views (absent rows, 0 after zero-fill); the peak hour
+  plus the next hold at least 50% of the excess in the 24 hours from onset; and
+  the hour 2 after the peak is at most 10% of the peak hour. Catches the
+  two-hour automated bursts the 10x rule misses because their second hour is
+  about half the first: `Mary_Ajami` (2026-04-24) went 0, 0, 0, then 71,971,
+  34,643, then 2,345.
+
+The "silent before" condition is what separates an automated burst from real
+news on a new or obscure page. `Pope_Leo_XIV` was also silent before its peak --
+the page did not exist -- and also had half its first day in two hours, but two
+hours later it still drew 721,495 views, far above a tenth of its peak; a burst
+falls off a cliff, news does not. Measured limitation: a two-hour burst on a page
+that already had ordinary traffic beforehand is not silent, so it is not
+caught (README, known limitations). It replaces the `flat_profile` flag first specified here, which was
+dropped because it did the opposite of its job on real data: a steep decay
+flattens the hour-of-day profile, so it flagged the 2024 election itself
+(`Donald_Trump`, the election article, `Republican_Party_(United_States)`),
+while a one-hour burst reads as extremely rhythmic, so it missed every burst.
+
+**`calendar_page`** — titles starting `Deaths_in_`, or containing a month and a
+year (`<Month>_<YYYY>`). These list pages fill up over their month instead of
+decaying (`Deaths_in_September_2025`: 79.7% of its excess after day 7).
+
+**`rekindled`** — the peak day is the 24-hour block from onset (day 1 = the
+first 24 hours) with the most excess among days 1 to 3. A spike is rekindled
+when any later block in its 720-hour window, from day 4 on, has more excess
+than that peak day. The cause is the 30-day merge rule: a page that qualifies
+again within 30 days of a spike's start extends that spike instead of opening a
+new one, so a second, bigger event lands inside the first spike's window and its
+attention is counted as the first spike's tail. `Rory_McIlroy` spiked on
+2025-03-16 (74,975 views that day); his Masters win on 2025-04-13 drew 1,393,648
+inside the same window, and the spike's attention half-life came out at 698
+hours -- the Masters, not a slow fade. Flag only; a rekindled spike's metrics are
+kept but not ranked.
+
+**Leaderboard eligibility.** A spike appears on a leaderboard only when its peak
+day carries at least 20,000 views of excess over its baseline (`daily_views` on
+the peak's UTC day minus `baseline`), and it is not a `burst`, not `rekindled`,
+and not a `calendar_page`. Ineligible spikes stay in `fct_half_life`, flagged; the
+eligibility rule is for ranking, not for the data.
 
 ## Curated grain — two tiers
 
@@ -111,11 +215,13 @@ cosmetic tail of the decay curve.
 
 **Known limitation.** Below the floor, an hour with 0 views and an hour dropped
 by the floor are indistinguishable in `page_hour`. The tail of a decay curve is
-truncated, not measured. Anything reading `page_hour` must treat a missing hour
-as unknown, never as zero — the same rule that applies to a missing source
-file. One consequence worth watching: for a spike that only just qualifies, half
-of `peak_excess` can land near the floor, so verify against `page_daily` before
-trusting a half-life measured near it.
+truncated, not measured. A missing SOURCE hour would be unknown, never zero --
+but Task 3 verified all 17,520 source hours present, so since Task 5 a missing
+page-hour is read as fewer than 10 views and zero-filled (see Definitions,
+hourly zero-fill). Were a source hour ever missing, that rule would have to be
+re-examined before any model ran over it. One consequence worth watching: for
+a spike that only just qualifies, half of `peak_excess` can land near the floor,
+so verify against `page_daily` before trusting a half-life measured near it.
 
 ## Exclusions
 
@@ -125,6 +231,17 @@ Drop before analysis:
   `Category:`, `Template:`, `Help:`, `Portal:`, `Wikipedia:`, `User:`
 - the literal title `-`
 - titles that fail UTF-8 decoding
+
+Applied at ingest, and applied again in dbt staging (`stg_page_daily`,
+`stg_page_hour`) so no model depends on the ingester having done it. A test
+(`assert_no_excluded_titles_in_staging`) proves none survive, and spells the
+rules out literally rather than reusing the macro, so a bug in one cannot hide
+in the other.
+
+**Candidate pages (Task 5).** Any page with at least one day of 1,000+ views is
+a candidate, materialized once as `int_candidate_pages`. Every later model joins
+against it rather than the full history: a spike day must clear 1,000, so no
+other page can spike, and `page_daily` cannot be read page by page affordably.
 
 `Main_Page` alone will dominate every leaderboard if it survives.
 
@@ -289,6 +406,21 @@ build and the verification, hours rather than months, at under a cent.
 Athena writes these files without min/max statistics on `page_title`, so a page
 lookup cannot skip row groups by title; the saving comes from the sorted column
 being small, not from skipping. Partitioning by `dt` is what prunes.
+
+**`page_daily` cannot skip data on a title filter, and is not rewritten to.**
+Measured on 2025-03-14 (NOTES, Task 4): each day is 5 files of one row group
+each; the writer records no min/max for text columns; Iceberg's per-file title
+bounds exist but every file spans nearly the whole alphabet, because Athena's
+parallel writers each sort their own slice of rows. And because a title occurs
+once a day, `page_title` overflows Parquet's dictionary and is stored PLAIN:
+14.4 MiB a day. So any query filtered on `page_title` reads that whole column for
+every day in its `dt` range -- about 10.3 GiB for the full history, more than
+the 5 GiB interactive cap. `page_hour`, where titles repeat and stay
+dictionary-encoded, reads about 3x less per day for the same lookup.
+Consequences, decided: models read `page_daily` in whole-table passes against
+the candidate-pages table, never page by page; and single-page lookups for the
+public page come from a small serving table built in Task 7, not from either
+curated table.
 
 **Once Iceberg owns a table, nothing writes or deletes files behind it.** New
 days are written THROUGH Iceberg -- an Athena `INSERT` from the staging prefix,

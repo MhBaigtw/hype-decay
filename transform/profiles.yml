@@ -1,0 +1,19 @@
+# No credentials here: dbt-athena authenticates through the local AWS profile,
+# which assumes the hype-decay-deploy role (CLAUDE.md: never commit credentials).
+hype_decay:
+  target: prod
+  outputs:
+    prod:
+      type: athena
+      region_name: us-east-1
+      aws_profile_name: hype-decay-deploy
+      # The dbt workgroup: 25 GiB per-query cap, enforced (infra/bootstrap).
+      work_group: hype-decay-dbt
+      s3_staging_dir: s3://hype-decay-athena-results-820697996849/dbt-results/
+      # Model tables land under marts/ in the curated bucket (SPEC storage model).
+      s3_data_dir: s3://hype-decay-curated-820697996849/marts/
+      s3_data_naming: schema_table_unique
+      database: awsdatacatalog
+      schema: hype_decay
+      threads: 4
+      num_retries: 1

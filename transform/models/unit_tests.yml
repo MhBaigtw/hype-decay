@@ -1,0 +1,231 @@
+version: 2
+
+# Unit tests run the real model SQL on Athena against small fixtures, so the
+# logic is checked without scanning a byte of the curated tables.
+
+unit_tests:
+
+  # --- SPEC worked example, part 1: the spine zero-fills -----------------------
+  # A page whose window holds 26 days at 5 views and 2 days at 400. At floor 10
+  # the 26 quiet days have NO row in page_daily, so stg_page_daily has only the
+  # two 400s and the 1,500-view day. The spine must turn every missing complete
+  # day into 0 -- and a day missing from complete_days (2025-01-15 here, an
+  # incomplete source day) into NULL, never 0.
+  - name: int_page_daily_zero_fills_the_worked_example
+    model: int_page_daily
+    overrides:
+      vars: {window_start: "2025-01-01", window_end: "2025-01-31"}
+    given:
+      - input: ref('int_candidate_pages')
+        rows:
+          - {page_title: P}
+      - input: ref('stg_page_daily')
+        rows:
+          - {page_title: P, dt: 2025-01-10, daily_views: 400}
+          - {page_title: P, dt: 2025-01-20, daily_views: 400}
+          - {page_title: P, dt: 2025-01-31, daily_views: 1500}
+      - input: ref('complete_days')
+        format: sql
+        rows: |
+          select cast(d as date) as dt, 24 as hours_done
+          from unnest(sequence(date '2025-01-01', date '2025-01-31', interval '1' day)) as t(d)
+          where d != date '2025-01-15'
+    expect:
+      format: sql
+      rows: |
+        select 'P' as page_title, cast(d as date) as dt,
+               case when d = date '2025-01-15' then cast(null as bigint)
+                    when d in (date '2025-01-10', date '2025-01-20') then cast(400 as bigint)
+                    when d = date '2025-01-31' then cast(1500 as bigint)
+                    else cast(0 as bigint) end as daily_views,
+               d not in (date '2025-01-10', date '2025-01-20', date '2025-01-31') as zero_filled,
+               d != date '2025-01-15' as source_complete
+        from unnest(sequence(date '2025-01-01', date '2025-01-31', interval '1' day)) as t(d)
+
+  # --- SPEC worked example, part 2: the baseline over the zero-filled spine ---
+  # For 2025-01-31 the window is rows 2025-01-02 .. 2025-01-29: 26 zeros and two
+  # 400s, so the median is 0 -- not the 400 a median over existing rows gives.
+  # Page Q is the same with 2025-01-15 NULL (incomplete source): left out, so 27
+  # values, median still 0. 2025-01-31 is the first evaluable day
+  # (window_start + 30), so it is the only row out.
+  - name: int_baselines_worked_example_is_zero_not_400
+    model: int_baselines
+    overrides:
+      vars: {window_start: "2025-01-01", evaluation_offset_days: 30}
+    given:
+      - input: ref('int_page_daily')
+        format: sql
+        rows: |
+          select p as page_title, cast(d as date) as dt,
+                 case when p = 'Q' and d = date '2025-01-15' then cast(null as bigint)
+                      when d in (date '2025-01-10', date '2025-01-20') then cast(400 as bigint)
+                      when d = date '2025-01-31' then cast(1500 as bigint)
+                      else cast(0 as bigint) end as daily_views
+          from unnest(sequence(date '2025-01-01', date '2025-01-31', interval '1' day)) as t(d)
+          cross join unnest(array['P', 'Q']) as u(p)
+    expect:
+      rows:
+        - {page_title: P, dt: 2025-01-31, daily_views: 1500, baseline_days: 28, baseline: 0.0}
+        - {page_title: Q, dt: 2025-01-31, daily_views: 1500, baseline_days: 27, baseline: 0.0}
+
+  # --- SPEC worked example, part 3, and the 30-day rule ------------------------
+  # P (zero-filled baseline 0) qualifies at 1,500. N carries the naive baseline
+  # of 400: 1,500 < 5 x 400, so it does NOT -- the real spike the SPEC says a
+  # median over existing rows misses. T fails the 1,000 floor. R qualifies on
+  # Feb 1, Feb 20, Mar 3 and Mar 10: Feb 20 is within 30 days of the Feb 1 start
+  # and extends it; Mar 3 is exactly 30 days later and opens a new spike, which
+  # Mar 10 extends.
+  - name: int_spikes_qualify_and_merge
+    model: int_spikes
+    given:
+      - input: ref('int_baselines')
+        rows:
+          - {page_title: P, dt: 2025-01-31, daily_views: 1500, baseline_days: 28, baseline: 0.0}
+          - {page_title: N, dt: 2025-01-31, daily_views: 1500, baseline_days: 28, baseline: 400.0}
+          - {page_title: T, dt: 2025-01-31, daily_views: 900, baseline_days: 28, baseline: 10.0}
+          - {page_title: R, dt: 2025-02-01, daily_views: 5000, baseline_days: 28, baseline: 100.0}
+          - {page_title: R, dt: 2025-02-20, daily_views: 5000, baseline_days: 28, baseline: 100.0}
+          - {page_title: R, dt: 2025-03-03, daily_views: 5000, baseline_days: 28, baseline: 100.0}
+          - {page_title: R, dt: 2025-03-10, daily_views: 5000, baseline_days: 28, baseline: 100.0}
+    expect:
+      rows:
+        - {spike_id: "P|2025-01-31", page_title: P, spike_start: 2025-01-31, qualifying_days: 1}
+        - {spike_id: "R|2025-02-01", page_title: R, spike_start: 2025-02-01, qualifying_days: 2}
+        - {spike_id: "R|2025-03-03", page_title: R, spike_start: 2025-03-03, qualifying_days: 2}
+
+  # --- The attention half-life (SPEC, Task 5 revision) ------------------------
+  # A, a known answer by hand. Baseline 0. Onset is 01:00 (40 views reaches 10%
+  # of the 100-view peak; 00:00's 5 does not). Excess from onset: 40, 100, 60,
+  # 40, 20, and 60 at hour 200; total 320, half 160. Running total: 40, 140,
+  # 200 -- it crosses 160 in the third hour, so the half-life is 3. The tail is
+  # the 60 at hour 200: 60 / 320 = 0.1875. Largest neighbour of the peak is 60,
+  # under a tenth of 100 is false, so not a burst. Peak day 30,000 over a
+  # baseline of 0: eligible.
+  # B, a burst: 5,000 views at 10:00, largest hour within 2h either side 200.
+  # L, a second day bigger than the first (the Liam_Payne shape): 1,000 in the
+  # news-break hour, 300 the next, then 24 hours of 100 -- day 2 (2,400) beats
+  # day 1 (1,300). Total 3,700, half 1,850: running 1,000, 1,300, then +100 an
+  # hour reaches 1,900 in the 8th hour. Attention half-life 8 -- while the OLD
+  # peak-hour definition says 1, because 300 is under half of 1,000.
+  # C, a calendar page whose 720 hours from onset run past the data end
+  # (2025-04-30): censored by window_end, both metrics NULL.
+  - name: fct_half_life_attention_metric
+    model: fct_half_life
+    overrides:
+      vars: {data_end_hour: "2025-04-30 00:00:00", leaderboard_min_peak_day_excess: 20000}
+    given:
+      - input: ref('int_spikes')
+        rows:
+          - {spike_id: "A|2025-03-01", page_title: A, spike_start: 2025-03-01, start_daily_views: 30000, baseline: 0.0, baseline_hourly: 0.0, qualifying_days: 1}
+          - {spike_id: "B|2025-03-05", page_title: B, spike_start: 2025-03-05, start_daily_views: 5370, baseline: 0.0, baseline_hourly: 0.0, qualifying_days: 1}
+          - {spike_id: "L|2025-03-10", page_title: L, spike_start: 2025-03-10, start_daily_views: 1300, baseline: 0.0, baseline_hourly: 0.0, qualifying_days: 2}
+          - {spike_id: "Deaths_in_April_2025|2025-04-20", page_title: Deaths_in_April_2025, spike_start: 2025-04-20, start_daily_views: 1500, baseline: 0.0, baseline_hourly: 0.0, qualifying_days: 1}
+      - input: ref('int_page_daily')
+        rows:
+          - {page_title: A, dt: 2025-03-01, daily_views: 30000, zero_filled: false, source_complete: true}
+          - {page_title: B, dt: 2025-03-05, daily_views: 5370, zero_filled: false, source_complete: true}
+          - {page_title: L, dt: 2025-03-10, daily_views: 1300, zero_filled: false, source_complete: true}
+          - {page_title: Deaths_in_April_2025, dt: 2025-04-20, daily_views: 1500, zero_filled: false, source_complete: true}
+      - input: ref('int_spike_hours')
+        format: sql
+        rows: |
+          select spike_id, page_title, hour_start, views, views = 0 as zero_filled from (
+            select * from (values
+              ('A|2025-03-01', 'A', timestamp '2025-03-01 00:00:00.000', 5),
+              ('A|2025-03-01', 'A', timestamp '2025-03-01 01:00:00.000', 40),
+              ('A|2025-03-01', 'A', timestamp '2025-03-01 02:00:00.000', 100),
+              ('A|2025-03-01', 'A', timestamp '2025-03-01 03:00:00.000', 60),
+              ('A|2025-03-01', 'A', timestamp '2025-03-01 04:00:00.000', 40),
+              ('A|2025-03-01', 'A', timestamp '2025-03-01 05:00:00.000', 20),
+              ('A|2025-03-01', 'A', timestamp '2025-03-09 09:00:00.000', 60),
+              ('B|2025-03-05', 'B', timestamp '2025-03-05 08:00:00.000', 30),
+              ('B|2025-03-05', 'B', timestamp '2025-03-05 09:00:00.000', 100),
+              ('B|2025-03-05', 'B', timestamp '2025-03-05 10:00:00.000', 5000),
+              ('B|2025-03-05', 'B', timestamp '2025-03-05 11:00:00.000', 200),
+              ('B|2025-03-05', 'B', timestamp '2025-03-05 12:00:00.000', 40),
+              ('L|2025-03-10', 'L', timestamp '2025-03-10 22:00:00.000', 1000),
+              ('L|2025-03-10', 'L', timestamp '2025-03-10 23:00:00.000', 300),
+              ('Deaths_in_April_2025|2025-04-20', 'Deaths_in_April_2025', timestamp '2025-04-20 00:00:00.000', 500)
+            ) as v(spike_id, page_title, hour_start, views)
+            union all
+            -- L, day 2: 24 hours of 100
+            select 'L|2025-03-10', 'L', h, 100
+            from unnest(sequence(timestamp '2025-03-11 00:00:00.000',
+                                 timestamp '2025-03-11 23:00:00.000', interval '1' hour)) as t(h)
+          ) x
+    expect:
+      rows:
+        - {spike_id: "A|2025-03-01", attention_half_life_hours: 3, long_tail_share: 0.1875, peak_hour_half_life_hours: null, burst: false, calendar_page: false, window_end: false, leaderboard_eligible: true}
+        - {spike_id: "B|2025-03-05", attention_half_life_hours: 1, long_tail_share: 0.0, peak_hour_half_life_hours: null, burst: true, calendar_page: false, window_end: false, leaderboard_eligible: false}
+        - {spike_id: "L|2025-03-10", attention_half_life_hours: 8, long_tail_share: 0.0, peak_hour_half_life_hours: 1, burst: false, calendar_page: false, window_end: false, leaderboard_eligible: false}
+        # C's 500-view hour stands alone (its neighbours are below 10 views,
+        # i.e. 0), so it is also a burst -- an isolated hour is the definition.
+        - {spike_id: "Deaths_in_April_2025|2025-04-20", attention_half_life_hours: null, long_tail_share: null, peak_hour_half_life_hours: null, burst: true, calendar_page: true, window_end: true, leaderboard_eligible: false}
+
+  # --- The short-burst and rekindled flags (SPEC, Task 5 final revision) -------
+  # S: a two-hour automated burst out of silence. 05:00-07:00 have no rows
+  # (under 10 views); 1,000 then 500, then 50 two hours after (<= 10% of 1,000),
+  # then 20 an hour. The 10x rule misses it (500 is half the peak, not a tenth),
+  # but it holds 1,500 of the first day's 1,950 excess: a short burst.
+  # N: real news on a new page -- also silent before, also big in its first two
+  # hours, but still 400 two hours after (> 10%): NOT a burst. The Pope_Leo_XIV
+  # shape.
+  # R: rekindled. Ordinary traffic around a 100-view peak (50 an hour either
+  # side, so neither burst rule applies): day 1 holds 360 of excess. Then 500 on
+  # day 20 of the window -- a second event the 30-day merge rule folded in. Not
+  # eligible.
+  # L2: a second day bigger than the first (the Liam_Payne shape) is NOT
+  # rekindled: day 2 is still inside days 1-3.
+  - name: fct_half_life_short_burst_and_rekindled
+    model: fct_half_life
+    overrides:
+      vars: {data_end_hour: "2025-06-30 00:00:00", leaderboard_min_peak_day_excess: 20000}
+    given:
+      - input: ref('int_spikes')
+        rows:
+          - {spike_id: "S|2025-03-01", page_title: S, spike_start: 2025-03-01, start_daily_views: 1950, baseline: 0.0, baseline_hourly: 0.0, qualifying_days: 1}
+          - {spike_id: "N|2025-03-02", page_title: N, spike_start: 2025-03-02, start_daily_views: 50000, baseline: 0.0, baseline_hourly: 0.0, qualifying_days: 1}
+          - {spike_id: "R|2025-03-05", page_title: R, spike_start: 2025-03-05, start_daily_views: 1100, baseline: 0.0, baseline_hourly: 0.0, qualifying_days: 1}
+          - {spike_id: "L2|2025-03-10", page_title: L2, spike_start: 2025-03-10, start_daily_views: 30000, baseline: 0.0, baseline_hourly: 0.0, qualifying_days: 2}
+      - input: ref('int_page_daily')
+        rows:
+          - {page_title: S, dt: 2025-03-01, daily_views: 1950, zero_filled: false, source_complete: true}
+          - {page_title: N, dt: 2025-03-02, daily_views: 50000, zero_filled: false, source_complete: true}
+          - {page_title: R, dt: 2025-03-05, daily_views: 1100, zero_filled: false, source_complete: true}
+          - {page_title: L2, dt: 2025-03-10, daily_views: 30000, zero_filled: false, source_complete: true}
+      - input: ref('int_spike_hours')
+        format: sql
+        rows: |
+          select spike_id, page_title, hour_start, views, views = 0 as zero_filled from (
+            select * from (values
+              ('S|2025-03-01', 'S', timestamp '2025-03-01 08:00:00.000', 1000),
+              ('S|2025-03-01', 'S', timestamp '2025-03-01 09:00:00.000', 500),
+              ('S|2025-03-01', 'S', timestamp '2025-03-01 10:00:00.000', 50),
+              ('N|2025-03-02', 'N', timestamp '2025-03-02 08:00:00.000', 1000),
+              ('N|2025-03-02', 'N', timestamp '2025-03-02 09:00:00.000', 600),
+              ('N|2025-03-02', 'N', timestamp '2025-03-02 10:00:00.000', 400),
+              ('R|2025-03-05', 'R', timestamp '2025-03-05 07:00:00.000', 50),
+              ('R|2025-03-05', 'R', timestamp '2025-03-05 08:00:00.000', 50),
+              ('R|2025-03-05', 'R', timestamp '2025-03-05 09:00:00.000', 50),
+              ('R|2025-03-05', 'R', timestamp '2025-03-05 10:00:00.000', 100),
+              ('R|2025-03-05', 'R', timestamp '2025-03-05 11:00:00.000', 60),
+              ('R|2025-03-05', 'R', timestamp '2025-03-05 12:00:00.000', 50),
+              ('R|2025-03-05', 'R', timestamp '2025-03-24 10:00:00.000', 500),
+              ('L2|2025-03-10', 'L2', timestamp '2025-03-10 22:00:00.000', 1000),
+              ('L2|2025-03-10', 'L2', timestamp '2025-03-10 23:00:00.000', 300)
+            ) as v(spike_id, page_title, hour_start, views)
+            union all
+            select 'S|2025-03-01', 'S', h, 20
+            from unnest(sequence(timestamp '2025-03-01 11:00:00.000',
+                                 timestamp '2025-03-02 06:00:00.000', interval '1' hour)) as t(h)
+            union all
+            select 'L2|2025-03-10', 'L2', h, 100
+            from unnest(sequence(timestamp '2025-03-11 00:00:00.000',
+                                 timestamp '2025-03-11 23:00:00.000', interval '1' hour)) as t(h)
+          ) x
+    expect:
+      rows:
+        - {spike_id: "S|2025-03-01", burst: true, short_burst: true, rekindled: false, leaderboard_eligible: false}
+        - {spike_id: "N|2025-03-02", burst: false, short_burst: false, rekindled: false, leaderboard_eligible: true}
+        - {spike_id: "R|2025-03-05", burst: false, short_burst: false, rekindled: true, leaderboard_eligible: false}
+        - {spike_id: "L2|2025-03-10", burst: false, short_burst: false, rekindled: false, leaderboard_eligible: true}
