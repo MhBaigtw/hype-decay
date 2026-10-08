@@ -176,13 +176,23 @@ revisiting before anything is built on top.
 
 ---
 
-## Task 6 — Hourly incremental
+## Task 6 — Daily incremental
 
-- EventBridge Scheduler, hourly, offset far enough past the hour that the
-  source file exists
-- Step Functions: fetch, land raw, convert, run affected dbt models
+**Changed from hourly to daily (2026-10-08, owner decision), with incremental dbt
+models.** Measured at Task 5's scan sizes: one rebuild of the full model chain
+reads 40.5 GiB ($0.20), so hourly would cost about $142 a month and daily about
+$6. Even rebuilding only `fct_half_life` every hour (6.56 GiB) is about $23 a
+month. A spike's metrics need 30 days after onset to settle anyway, so nothing
+the site shows changes meaningfully within a day. Incremental models -- only
+new days and the spikes whose windows they touch -- should take daily well under
+the $6 full-rebuild figure. Task 7 is done first.
+
+- EventBridge Scheduler, daily, offset far enough past midnight UTC that the
+  day's last source hour (D+1 T00) exists
+- Step Functions: fetch the day's 24 hours, compact, publish to Iceberg (SPEC),
+  run the affected dbt models incrementally, reload the serving table
 - SNS alert on failure
-- Idempotent. Running the same hour twice changes nothing.
+- Idempotent. Running the same day twice changes nothing.
 
 **Definition of done:** runs unattended for 48 hours with no manual
 intervention and no duplicate rows.

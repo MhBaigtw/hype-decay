@@ -22,11 +22,16 @@ and measure how fast attention fades. Task 6, the hourly incremental, is next.
 leaderboards: at least 20,000 views of excess on the peak day, and none of the
 flags below.
 
-| Qualifying spikes (uncensored, n = 21,491) | Attention half-life |
-|---|---|
-| fastest quarter | 14 hours or less |
-| **median** | **27 hours** |
-| slowest quarter | 66 hours or more |
+| Attention half-life | Qualifying spikes (n = 21,491) | Including rekindled spikes (n = 24,092) |
+|---|---|---|
+| fastest quarter | 14 hours or less | 16 hours or less |
+| **median** | **27 hours** | **33 hours** |
+| slowest quarter | 66 hours or more | 98 hours or more |
+
+**The 27-hour median excludes rekindled spikes** -- 15.1% of all spikes, and
+10.6% (2,651 of 24,951) of those big enough to qualify -- because their measured
+"decay" includes a second, later event (see Flags below). Counting them anyway
+gives a median of **33 hours**. Both figures are uncensored spikes only.
 
 Half of a typical spike's 30-day excess attention arrives within about a day
 of its onset; the median spike gets 13.8% of that excess after its first week.
