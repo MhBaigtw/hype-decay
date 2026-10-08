@@ -34,11 +34,16 @@ provider "aws" {
 
   # Every resource gets these, so Cost Explorer can attribute spend to this
   # project and an untagged resource stands out as something created by hand.
+  #
+  # Task is deliberately NOT a default tag. A module-wide value is true only of
+  # the resources made in that task: it said task-1-guardrails on the curated
+  # bucket and the manifest, which Task 2 created, and bumping it per task would
+  # relabel the Task 1 state bucket instead. Each top-level resource carries the
+  # task that introduced it.
   default_tags {
     tags = {
       Project   = var.project
       ManagedBy = "terraform"
-      Task      = "task-1-guardrails"
     }
   }
 }

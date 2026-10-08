@@ -35,6 +35,34 @@ hour_start), with `views` summed across desktop and mobile.
 days, ending 2 days before the day being evaluated. The 2-day offset stops a
 spike from inflating its own baseline.
 
+**The baseline must be computed over a zero-filled date spine, not over the rows
+that exist.** `page_daily` has no row for a page-day below the 10-view floor
+(see Curated grain), and none for a page-day with zero views even without a
+floor. A median taken over existing rows silently drops exactly the quiet days
+that define a baseline.
+
+Worked example. A page's 28-day window holds 26 days at 5 views and 2 days at
+400. At floor 10 the 26 quiet days have no rows, so a median over existing rows
+is median(400, 400) = **400**, and the spike test needs `5 × 400 = 2,000` views.
+A day of 1,500 views is a real spike — the true baseline is 5, and 1,500 clears
+`5 × 5`, `5 + 500` and `1,000` — but against 400 it is missed. Zero-filled, the
+window is 26 zeros and two 400s, median **0**, and the 1,500-view day qualifies
+on the absolute floors exactly as it should.
+
+Requirements on the baseline model:
+
+- Build the spine only for **candidate pages**: any page with at least one
+  page-day of `daily_views >= 1000` in the window. A spike day must clear 1,000
+  by definition, so no other page can ever need a baseline, and a spine over
+  every page would be millions of pages × 730 days of zeros.
+- A spine day with no `page_daily` row is **0**. The error this introduces is
+  bounded by the floor: the true value was 0–9 views, so `baseline` is
+  understated by under 10 views a day and `baseline_hourly` by under 0.4.
+- A spine day whose SOURCE is incomplete — the manifest day row is not
+  `compacted`, or the compacted day was built with hours missing — is **NULL,
+  not 0**, and is left out of the median. Zero-fill stands in for a quiet page,
+  never for an outage.
+
 **`baseline_hourly`** — `baseline / 24`.
 
 **spike** — a day qualifies when all three hold:
@@ -65,9 +93,17 @@ changed how often the page is read, and hiding that is dishonest.
 
 ## Curated grain — two tiers
 
-`page_daily` is written for every English page-day.
+`page_daily` is written for every English page-day with 10 or more daily views.
+The floor is applied when the day is compacted (see Storage model); the hourly
+partials before compaction carry every page.
 
 `page_hour` is written only where hourly views are 10 or more.
+
+The daily floor removes 75.5% of page-days and 7.4% of views, and shrinks the
+compacted day 3.8x, measured on 2026-09-10 (NOTES, Task 3). It cannot hide a
+spike, because a spike day clears 1,000 views, but it does remove the quiet days
+a baseline is made of -- which is why the baseline is zero-filled (see
+Definitions).
 
 Spike qualification requires `daily_views >= 1000`, so a qualifying page has a
 half-life point far above a 10-view floor; the truncation affects only the
@@ -149,11 +185,20 @@ scope and will not be attempted.
 ## Storage model
 
 ```
-s3://<bucket>/curated/page_daily/           Iceberg, partitioned by dt
-s3://<bucket>/curated/page_hour/            Iceberg, partitioned by dt
+s3://<bucket>/curated/iceberg/page_hour/     Iceberg, partitioned by dt, sorted by page_title
+s3://<bucket>/curated/iceberg/page_daily/    Iceberg, partitioned by dt, sorted by page_title
+s3://<bucket>/curated/page_daily/dt=.../part-<source hour>.parquet   ingest staging: hourly partial
+s3://<bucket>/curated/page_daily/dt=.../day.parquet                  ingest staging: compacted day
+s3://<bucket>/curated/page_hour/dt=/hour=/  ingest staging: plain Parquet, one file per hour
 s3://<bucket>/marts/                        dbt outputs
 s3://<bucket>/fixtures/raw_48h/*.gz         48 hours of source gz, fixture only
 ```
+
+Since Task 4 the Iceberg tables `hype_decay.page_hour` and `hype_decay.page_daily`
+are the curated zone and the only thing anything downstream reads. The plain
+Parquet prefixes are where the ingester and the compactor stage their output;
+the two-year backfill's copy there was deleted once the Iceberg tables were
+verified identical to it (NOTES, Task 4).
 
 **There is no persistent raw zone.** Conversion to Parquet happens in flight
 during the backfill transfer. No untouched copy of the source is retained.
@@ -170,6 +215,134 @@ manifest, byte-verifiable against what was originally read.
 
 Retain 48 hours of raw gz as a format-regression test fixture, and nothing
 more. Upstream changing its line format is the failure that fixture catches.
+
+**`page_daily` is compacted once a day is whole.** The ingester works an hour at
+a time, so it writes one partial per source hour. `ingest/compact_day.py` sums
+the 24 partials for a day into a single `day.parquet` and deletes them. Measured
+on the fixture hour, a partial is 22.7 MiB, so keeping partials for the whole
+window would cost roughly 389 GiB against 37.7 GiB for all of `page_hour` -- the
+partials, not the data, would be the bill.
+
+A day is complete when source hours `D T01`..`D T23` **and** `(D+1) T00` are all
+done. That last one is the trap: the file named `(D+1) T00` holds `D` 23:00-24:00.
+
+**The daily-views floor is applied at compaction and nowhere else.** An hour
+cannot know whether a page will clear a daily threshold, so flooring per hour
+would drop pages that qualify once the day is whole. The floor is 10. A
+compacted day can be refloored HIGHER from its own `day.parquet`; it can never
+be refloored lower, because the rows under the old floor exist only at the
+source, so lowering a floor is a re-ingest.
+
+**A compacted day is closed to partials.** `day.parquet` already holds every
+hour of the day, so a partial written beside it is counted twice by anything
+that lists the partition, and the total looks entirely plausible. The ingester
+refuses to write a partial into a day whose manifest day row is `compacted` or
+`compacting`. A forced re-ingest of an hour in a compacted day first flips the
+day row to `invalidated` and moves `day.parquet` out of the partition into a
+quarantine prefix, so the partition reads as a gap until the day is rebuilt.
+Rebuilding needs all 24 partials, and compaction deleted 23 of them, so
+invalidating a day means re-ingesting the whole day. The compactor rebuilds
+only from the 24 expected partial keys, refuses if a compacted object sits
+beside them, and checks the rebuilt day's rows and views against the totals the
+invalidation recorded.
+
+Compaction stages the new object, deletes the partials, then puts the compacted
+object in place. That order leaves the partition briefly EMPTY rather than
+briefly DOUBLE-COUNTED: an empty partition is a visible gap, a double count is a
+silent wrong answer. The manifest day row is the authority on which days are
+compacted.
+
+**Who writes which format.** The ingester writes plain Parquet with Hive-style
+partition prefixes (`dt=`, `hour=`). Athena creates the Iceberg tables and
+writes into them from that staging copy (Task 4).
+
+Reasoning: writing Iceberg from the ingester would put a pyiceberg and
+Glue-catalog dependency inside a script whose entire job is one HTTP GET, one
+parse and three PUTs, and it would duplicate catalog work that Athena does
+natively. Keeping table format in one place keeps the ingester something that can
+be read in one sitting.
+
+The trade-off, stated plainly: until Task 4 runs there are no snapshots and no
+atomic commits over the curated zone, so a reader can see a half-written day. The
+**manifest**, not the S3 file listing, is the authority on which hours are
+complete. Task 2 wrote plain Parquet while this spec still said Iceberg; this
+paragraph replaces that silent divergence.
+
+**Task 4 REWRITES into Iceberg; it does not adopt the files in place.** This
+reverses the earlier decision in this spec, which favoured Glue's `add_files`
+procedure to avoid holding two copies. Measured on March 2025 of `page_hour`
+(NOTES, Task 4), an Athena `INSERT ... ORDER BY dt, page_title` into Iceberg:
+
+- stored the month in 313 MiB instead of 1,699 MiB, 5.4x smaller, because a
+  title's 24 hours sit together and compress to almost nothing, and zstd
+  replaces snappy
+- scanned 10.5x fewer bytes for one page's curve across the month, the lookup
+  Task 7 serves, and 1.3x fewer for per-day totals
+- replaced one 2 MiB file per hour, each spanning the whole alphabet, with
+  about 9 files per day
+
+Adoption would have kept all of that as it was: 17,520 files, unsorted, with no
+`dt` column inside the `page_hour` files for an Iceberg partition to be built
+from. The double storage the earlier reasoning feared lasts only between the
+build and the verification, hours rather than months, at under a cent.
+
+Athena writes these files without min/max statistics on `page_title`, so a page
+lookup cannot skip row groups by title; the saving comes from the sorted column
+being small, not from skipping. Partitioning by `dt` is what prunes.
+
+**Once Iceberg owns a table, nothing writes or deletes files behind it.** New
+days are written THROUGH Iceberg -- an Athena `INSERT` from the staging prefix,
+once a day is compacted -- never by putting a file under `curated/iceberg/`. A
+file that appears there without a metadata commit is invisible to readers, and a
+file removed without one makes every snapshot that references it unreadable.
+The manifest stays the record of what was fetched; Iceberg is the record of
+what is queryable.
+
+**Publishing a day, and what the manifest says about it.** `ingest/publish.py`.
+A compacted day is published by replacing that `dt` in both Iceberg tables from
+its staging copy, then checking the result against the manifest: `page_daily`
+rows and views against the day row, `page_hour` rows per hour against each hour
+row's `rows_page_hour`. The day row records it:
+
+- `iceberg_state`: `replacing` while the DELETE and INSERT run, `published` once
+  they matched the manifest; `iceberg_published_at` and `iceberg_state_at`
+- `staging_removed_at`: when the staging `day.parquet` and the day's 24
+  `page_hour` staging files were deleted. At the same moment the fields that
+  named them -- `key_compacted` on the day row, `key_page_hour` and
+  `key_page_daily` on its hour rows -- are REMOVED. The manifest never names a
+  file that does not exist.
+
+Staging is retired only for a day whose `iceberg_state` is `published`: it is
+the only other copy until then.
+
+**Correcting a day after the switch.** `ingest/republish_day.py --dt D`:
+
+1. re-ingest D's 24 source hours with `--force`. The day row flips to
+   `invalidated` (double-count guard) and the partials come back to staging.
+2. recompact. Built from exactly those 24 partials, and checked against the
+   totals the invalidation recorded.
+3. replace D in Iceberg: `DELETE ... WHERE dt = D`, then `INSERT ... SELECT`
+   from staging, in each table, then check against the manifest. Never an INSERT
+   alongside the old rows -- that is a double count inside Iceberg. Between the
+   DELETE and the INSERT a reader sees D empty: a gap, never twice. A `MERGE`
+   would be one commit, but Athena's has no `WHEN NOT MATCHED BY SOURCE`, so it
+   could not remove a row the corrected data no longer has.
+4. retire D's staging copy, as above.
+
+The script snapshots rows, views and a row-level checksum for every day of D's
+month before and after, and fails unless D is as intended and no other day
+changed. A refloor of a retired day is refused by `compact_day.py`: there is no
+staging file left to refloor.
+
+**Where a correction runs.** A single-day correction may run from the laptop:
+the one proof run (2025-03-15) did, with 24 downloads on one connection and one
+compaction. **Any correction touching more than one day runs on the backfill
+instance, not the laptop.** Three reasons, all measured: a day's compaction
+peaks at 3.0 to 4.9 GiB and the laptop had 0.5 GiB free, so it pages; every day
+is about 1.4 GB fetched, which belongs on an AWS network rather than the home
+connection the Wikimedia rate limits apply to; and the instance's wrapper, stall
+alarm and self-termination make a multi-hour job safe to leave, where a laptop
+that sleeps -- as it did during backfill run 1's monitoring -- simply stops.
 
 ## v1 acceptance
 

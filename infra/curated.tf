@@ -9,6 +9,7 @@
 
 resource "aws_s3_bucket" "curated" {
   bucket = "${var.project}-curated-${data.aws_caller_identity.current.account_id}"
+  tags   = { Task = "task-2-ingest" }
 }
 
 resource "aws_s3_bucket_public_access_block" "curated" {
@@ -78,6 +79,7 @@ resource "aws_dynamodb_table" "manifest" {
   name         = "${var.project}-manifest"
   billing_mode = "PAY_PER_REQUEST" # CLAUDE.md: DynamoDB on-demand only
   hash_key     = "source_hour"
+  tags         = { Task = "task-2-ingest" }
 
   # source_hour is the hour in the SOURCE FILENAME, e.g. 2026-09-10T18, which
   # is the END of the capture window. The row also stores hour_start, which is

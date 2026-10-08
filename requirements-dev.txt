@@ -1,0 +1,4 @@
+# Test-only. Never installed on the backfill instance.
+#   .venv/Scripts/python -m pip install -r requirements-dev.txt
+-r requirements.txt
+moto[s3,dynamodb]>=5

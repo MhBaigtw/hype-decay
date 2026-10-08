@@ -78,9 +78,23 @@ backfill.
 
 ## Task 3 — Backfill
 
+**Status: done, 2026-10-05.** 17,520 of 17,520 hours done, 0 failed; 730 of
+730 days compacted at floor 10 and reconciled to their hours
+(`ingest/verify_backfill.py`). See NOTES, Task 3.
+
 Scale Task 2 to 2 years without getting the owner's IP banned.
 
-- Sequential, throttled, resumable, restartable after days of downtime
+- Runs on the time-boxed instance, not a laptop. CLAUDE.md permits exactly one,
+  terminated on completion with a documented shutdown check
+- Fetches from the your.org mirror, which carries a byte-identical copy of the
+  same tree (sha256 verified against the origin) and is roughly 11x faster. The
+  canonical origin URL is recorded in the manifest for every hour regardless, and
+  the origin content-length is checked per file
+- Still capped at 3 connections. The cap is Wikimedia policy for the origin and
+  plain courtesy for a mirror
+- Throttled, resumable, restartable after days of downtime
+- Compacts each day as soon as its 24 hours are done, then deletes the partials.
+  Uncompacted partials are the dominant storage cost, not the data
 - Gaps logged explicitly. Wikimedia has had outages; missing hours are real
   and must be visible in the data, never silently filled
 - Progress visible without SSH — CloudWatch metric or a manifest query
@@ -91,6 +105,15 @@ explicitly failed with a reason, and the failure count is under 1%.
 ---
 
 ## Task 4 — Source to curated
+
+**Status: done, 2026-10-07, re-scoped by the owner.** The ingester already
+writes partitioned Parquet, so the Glue conversion job below was not needed.
+Delivered instead: `page_hour` and `page_daily` as Iceberg tables in the Glue
+Data Catalog, queryable in Athena with partition pruning; rewrite chosen over
+`add_files` on measurement; all 730 days verified identical and against the
+manifest; 15/15 REST spot checks exact; scanned bytes with and without a
+partition filter recorded in the README. See NOTES, Task 4. The original
+scope follows, for the record.
 
 Glue Spark job, max 10 DPU, 30 minute timeout.
 

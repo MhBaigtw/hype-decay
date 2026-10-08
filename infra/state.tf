@@ -22,6 +22,7 @@
 resource "aws_s3_bucket" "tfstate" {
   # Bucket names are globally unique, so the account id is the suffix.
   bucket = "${var.project}-tfstate-${data.aws_caller_identity.current.account_id}"
+  tags   = { Task = "task-1-guardrails" }
 
   # State is the one thing here that is genuinely painful to lose: without it,
   # Terraform no longer knows what it created and every resource has to be

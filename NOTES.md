@@ -116,3 +116,187 @@ killed worker leaves stuck forever.
 **Breaks at 10x:** 17,520 hourly page_daily partials would be ~389 GiB. They must
 be compacted per day and the partials deleted, or curated storage alone breaks
 the $30 budget.
+
+---
+
+## Task 3 pre-design — does page_daily need every page?
+
+**Measured** (300 pages from `page_daily`, strata from 1 view up; 64 SPEC
+spikes): at floor 10, 2 of 64 spike baselines move more than 10%; at 100, 10 of
+64. Real spikes lost: 0 at every floor. False spikes created: 0 of 236 quiet
+pages, at every floor.
+
+**Why detection cannot break for a quiet page.** SPEC requires all three of
+`daily_views >= 1000`, `>= baseline + 500`, and `>= 5 * baseline`. For any page
+with a baseline under 200, `5 * baseline < 1000` and `baseline + 500 < 700`, so
+the absolute 1000-view floor is the binding condition. A spike day clears 1000
+by definition and is never floored. So no daily floor up to 200 can change
+whether a spike on that page is detected.
+
+**What a floor breaks is magnitude, not detection.** `peak_excess = views(peak)
+- baseline/24`, so an understated baseline inflates excess and shifts the
+half-life. Two of 64 baselines moved at floor 10, so the floor stays at 0 until
+the bytes it saves are measured against a compacted day.
+
+---
+
+## Task 3, mid-task — credits, the double-count guard, floor 10
+
+**Credits blinded both tripwires.** Cost Explorer, September by `RECORD_TYPE`:
+usage +$0.2414, credit −$0.2414, net zero. Budgets counted credits and read
+$0.00. `EstimatedCharges` read $0.00 too, at the total and per service, so the
+CloudWatch metric is net of credits and has no gross form. Neither guardrail
+could have fired. The budgets now exclude credits and refunds.
+
+**Double-count guard.** A partial written beside a compacted `day.parquet` is
+counted twice. The ingester refuses to write into a `compacted` or `compacting`
+day. `--force` flips the day row to `invalidated` and quarantines `day.parquet`.
+Seen on 2026-09-10: force-ingested T18, compaction refused at 1 of 24 partials,
+re-ingested the day, rebuild 190,364,968 → 190,364,968 views.
+
+**Decision: daily floor 10.** It removes 75.5% of page-days and 7.41% of views.
+The day shrinks from 92.4 MB to 24.3 MB, so 730 days come to about 16.5 GiB, and
+the dbt workgroup cap is 25 GiB. Rejected: floor 0, at 62.8 GiB. Its price is
+that baselines must zero-fill (SPEC).
+
+**Breaks at 10x:** correcting one hour re-fetches its whole day.
+
+**On the instance:** `code/` holds commit
+`0ac7fc83dbdb75402b66df064f37546e48c969c2`.
+
+---
+
+## Task 3 — measurement run on the instance (2026-10-03)
+
+**Ran:** `i-04d58a137d31e0361`, c7g.xlarge, AL2023 kernel 6.18, commit
+`0ac7fc8`. Time box 180 minutes; the timer was verified armed over SSM. Launched
+20:02:17Z, terminated 20:05:59Z once the run ended; root volume confirmed gone.
+Cost about $0.01.
+
+**Which service does what:** EC2 ran the measurement, SSM Run Command drove it
+without an inbound port, and S3 supplied the pinned code.
+
+**Measured, one whole day (24 files, 1,354 MiB):** download 333.9 MiB/s at 3
+connections, parse 3.84 s per file. Full window: download 0.8 h, parse 4.7 h,
+so processing binds, not the connection cap. Estimated $0.68.
+
+**Memory:** parse worker peak 1,582 MiB, compaction peak 5,435 MiB. Four workers
+plus one compaction need 11.49 GiB against 7.6 GiB usable. They do not fit, so
+compaction cannot overlap parsing on this box as designed.
+
+**Decision:** terminated by hand, not by the timer. Rejected: letting the timer
+do it, which bills three hours for four minutes of work.
+
+**Breaks at 10x:** compaction memory grows with distinct titles per day, and it
+already takes 70% of the box.
+
+---
+
+## Task 3 — 3-day backfill trial (2026-10-04)
+
+**Ran:** `backfill.py` for 2024-09-13 to 2024-09-15 on `i-05229fb4658780aa7`,
+commit `7390248`, 45-minute time box. Launched 02:03:58Z, terminated by
+`terraform apply` at 02:12:51Z; root volume confirmed gone.
+
+**Which service does what:** EC2 ran the runner, DynamoDB held every decision
+it made, CloudWatch took per-day progress, and S3 took the Parquet.
+
+**Measured:** 66.6 s a day (42 s ingest, 24 s compaction, about 9 s of that a
+trial-only copy). Peaks: parse 1,608 MiB, compaction 5,714 MiB. MemAvailable
+never fell below 1,456 MiB. 77 S3 requests a day. All three days matched an
+independent recompaction and the manifest's per-hour totals.
+
+**Decision:** parsing and compaction alternate. Rejected: overlapping them,
+which needs 11.5 GiB on a 7.6 GiB box. Full-run time box: 18 h, from 58 s a
+day × 730 × 1.5.
+
+**Found:** `Manifest.fail` wrote the reserved word `error`, so no hour could
+ever be marked failed. moto caught it, and real DynamoDB confirmed it.
+
+**Breaks at 10x:** compaction memory. It left 1.4 GiB free.
+
+---
+
+## Task 3 — full backfill, run 1 stopped at day 351 (2026-10-04)
+
+**Ran:** `i-0d7641b7a9b0af924`, commit `a3d3b03`, 18 h time box. Launched
+02:22Z. It shut itself down between 07:53Z and about 08:50Z. CloudTrail shows no
+`TerminateInstances`, so nothing outside the box terminated it. The volume
+deleted with it, and state was cleaned by a refresh-only apply.
+
+**Got done:** 8,424 hours `done`, 0 failed. 350 days compacted at floor 10,
+through 2025-08-27. 2025-08-28 has all 24 hours ingested but no day row, so it
+died in that day's compaction.
+
+**Cause, most likely:** memory. The compaction peak ranged from 5.6 to 7.1 GiB by
+day against 7.6 GiB usable, and 19 days fell under 500 MiB free. The final log
+upload never ran, and the disk is gone, so this is inferred, not observed.
+
+**Decision pending:** fix compaction memory before relaunching. Rejected:
+relaunching as-is, which would die again on the next heavy day.
+
+**Breaks at 10x:** whole-day compaction in memory. It does not survive this
+scale now.
+
+---
+
+## Task 3 — Backfill, done (2026-10-05)
+
+**Built:** `backfill.py`, a manifest-driven runner, plus a detached,
+self-terminating wrapper. Run 2 (`i-077613891baaf869c`, 12 h box) ran 8.65 h and
+terminated itself at 03:05Z.
+
+**Which service does what:** EC2 parses, S3 holds the Parquet and the logs,
+DynamoDB holds every decision, CloudWatch carries progress and a stall alarm.
+
+**Verified:** 17,520 of 17,520 hours done, 0 failed. 730 days compacted at floor
+10, each matching the sum of its 24 hourly totals. No partials, leftovers or
+fixtures. Curated zone 52.83 GiB: page_hour 35.84, page_daily 16.99.
+
+**Cost:** 14.42 instance-hours across every launch. $2.82 of October usage plus
+$0.37 tax; no credits applied yet.
+
+**Decision:** incremental compaction, peaking at 4,882 MiB. Rejected: the
+all-at-once engine, which peaked at 7,393 MiB on 2025-08-28 and killed run 1.
+The outputs are identical.
+
+**Breaks at 10x:** one box and three connections. Ten times the window is about
+90 h, and a day with 10x the pages would exhaust memory even incrementally.
+
+---
+
+## Guardrails — both alert paths proven (2026-10-07)
+
+**Budget path:** the $0.01 tripwire budget emailed on 2026-10-02, $0.08 actual
+against $0.01, once it stopped counting credits. The test budget is now retired.
+
+**SNS alarm path:** the backfill stall alarm emailed through the
+`hype-decay-alerts` topic on 2026-10-04 (a false stall at launch, since fixed).
+
+So a budget breach and a CloudWatch alarm both reach the inbox. The stall alarm
+is now created disarmed, armed only after the first compacted day, and sends
+`ok_actions` on recovery.
+
+---
+
+## Task 4 — Curated zone in the Glue Data Catalog, as Iceberg (2026-10-07)
+
+**Built:** `hype_decay.page_hour` and `page_daily` in Iceberg, partitioned by
+`dt` and sorted by title. Glue holds the catalog, Athena writes and queries the
+tables, S3 stores them, and DynamoDB records each day's publish state.
+
+**Decision:** an Athena rewrite. Rejected: Glue `add_files` over the existing
+files. On March 2025 the rewrite stored `page_hour` 5.4x smaller and scanned
+10.5x fewer bytes per page lookup. Adopting the files would have kept 17,520
+unsorted hourly files that have no `dt` column.
+
+**Verified:** all 730 days matched the old copy by rows, views and row checksum
+before the old copy was deleted. Both tables match the manifest per day and per
+hour. 15 of 15 spot checks matched the REST API exactly. The curated zone shrank
+from 52.83 GiB to 18.49 GiB. About 145 GiB was scanned overall, roughly $0.71.
+
+**Correction path:** `republish_day.py` replaces a day with DELETE then INSERT.
+Proven on 2025-03-15: identical result, no other day touched.
+
+**Breaks at 10x:** `page_daily` lookups read the whole title column, 14.4 MiB
+a day, with nothing to skip. Ten times the pages exceeds the dbt cap.

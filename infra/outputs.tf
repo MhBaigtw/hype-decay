@@ -1,5 +1,5 @@
 output "state_bucket" {
-  description = "Terraform state bucket. Goes in the backend block in versions.tf."
+  description = "Terraform state bucket. This module keeps its state under guardrails/."
   value       = aws_s3_bucket.tfstate.bucket
 }
 
@@ -9,7 +9,7 @@ output "state_lock_method" {
 }
 
 output "manifest_table" {
-  description = "Ingestion manifest. One row per source hour."
+  description = "Ingestion manifest: one row per source hour, plus a day# row per compacted day."
   value       = aws_dynamodb_table.manifest.name
 }
 
@@ -18,35 +18,17 @@ output "curated_bucket" {
   value       = aws_s3_bucket.curated.bucket
 }
 
-output "athena_workgroup" {
-  description = "Scan-limited Athena workgroup. Every query must run in this workgroup."
-  value       = aws_athena_workgroup.main.name
-}
-
-output "athena_scan_limit_gib" {
-  description = "Per-query scan limit, in GiB."
-  value       = var.athena_scan_limit_bytes / 1024 / 1024 / 1024
-}
-
 output "athena_results_bucket" {
   description = "Where query results land. Results expire automatically."
   value       = aws_s3_bucket.athena_results.bucket
 }
 
-output "alerts_topic_arn" {
-  description = "SNS topic both cost tripwires publish to."
-  value       = aws_sns_topic.alerts.arn
-}
-
-output "deploy_role_arn" {
-  description = "Least-privilege role the pipeline assumes. Not for interactive use."
-  value       = aws_iam_role.deploy.arn
-}
-
-output "next_steps" {
-  description = "What has to happen by hand after this apply."
+output "owned_by_bootstrap" {
+  description = "What this module deliberately does NOT manage, and where it lives."
   value = join("\n", [
-    "1. Click the confirmation link in the SNS email sent to ${var.contact_email}.",
-    "2. Once the tripwire-test budget emails you, set create_tripwire_test_budget = false and apply.",
+    "deploy role, budgets, billing alarm, SNS alerts topic and both Athena",
+    "workgroups live in infra/bootstrap, applied with AWS_PROFILE=hype-decay.",
+    "This module is applied as the deploy role, which is denied delete and",
+    "modify on every one of them.",
   ])
 }

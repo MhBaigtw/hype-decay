@@ -1,17 +1,17 @@
 # ---------------------------------------------------------------------------
-# Athena workgroup with a hard per-query scan limit.
+# Athena query results bucket.
 #
-# Athena bills per byte scanned. One careless SELECT * over two years of data
-# is the fastest way to spend this project budget in a single query, so the
-# workgroup refuses any query that would scan more than the limit. The limit is
-# enforced at the workgroup level (enforce_workgroup_configuration) so a client
-# cannot override it by sending its own settings.
+# The WORKGROUPS moved to infra/bootstrap. A scan limit the deployer can raise is
+# not a limit, so both workgroups are admin-owned and the deploy role is denied
+# athena:UpdateWorkGroup and athena:DeleteWorkGroup on them.
 #
-# CLAUDE.md: if a query trips this, fix the query. Do not raise the limit.
+# This bucket stays here: it is storage rather than a guardrail, and its
+# lifecycle rule is something the pipeline legitimately owns.
 # ---------------------------------------------------------------------------
 
 resource "aws_s3_bucket" "athena_results" {
   bucket = "${var.project}-athena-results-${data.aws_caller_identity.current.account_id}"
+  tags   = { Task = "task-1-guardrails" }
 }
 
 resource "aws_s3_bucket_public_access_block" "athena_results" {
@@ -49,31 +49,6 @@ resource "aws_s3_bucket_lifecycle_configuration" "athena_results" {
 
     abort_incomplete_multipart_upload {
       days_after_initiation = 1
-    }
-  }
-}
-
-resource "aws_athena_workgroup" "main" {
-  name        = var.project
-  description = "Scan-limited workgroup. Every query must filter on a partition column."
-  state       = "ENABLED"
-
-  configuration {
-    # The guardrail itself.
-    bytes_scanned_cutoff_per_query = var.athena_scan_limit_bytes
-
-    # Clients cannot substitute their own result location or scan limit.
-    enforce_workgroup_configuration = true
-
-    # Needed to see bytes-scanned per query, which Task 4 has to report.
-    publish_cloudwatch_metrics_enabled = true
-
-    result_configuration {
-      output_location = "s3://${aws_s3_bucket.athena_results.bucket}/query-results/"
-
-      encryption_configuration {
-        encryption_option = "SSE_S3"
-      }
     }
   }
 }
